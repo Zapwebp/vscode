@@ -470,7 +470,32 @@ var require_errors = __commonJS({
       E_RATE_LIMIT: {
         code: "E_RATE_LIMIT",
         message: "Too many requests. Rate limit threshold exceeded.",
-        fix: "Wait a few moments before submitting additional requests."
+        fix: "Wait a few moments before submitting additional requests, or raise the rate limit."
+      },
+      E_TOO_MANY_FILES: {
+        code: "E_TOO_MANY_FILES",
+        message: "This batch has exceeded the maximum allowed number of files.",
+        fix: "Drop fewer files, or raise the maxFilesPerRequest limit."
+      },
+      E_REQUEST_TOO_LARGE: {
+        code: "E_REQUEST_TOO_LARGE",
+        message: "This batch has exceeded the maximum allowed byte size.",
+        fix: "Reduce the batch size, or raise the maxBytesPerRequest limit."
+      },
+      E_SESSION_LIMIT_EXCEEDED: {
+        code: "E_SESSION_LIMIT_EXCEEDED",
+        message: "The current session has reached its maximum file processing limit.",
+        fix: "Start a new session or raise maxFilesPerSession."
+      },
+      E_USER_LIMIT_EXCEEDED: {
+        code: "E_USER_LIMIT_EXCEEDED",
+        message: "The user account has exceeded its allocated file limit for this period.",
+        fix: "Wait for the quota reset period or raise maxFilesPerUser."
+      },
+      E_CONCURRENCY_LIMIT_EXCEEDED: {
+        code: "E_CONCURRENCY_LIMIT_EXCEEDED",
+        message: "Concurrency limit exceeded. Too many conversions are active simultaneously.",
+        fix: "Wait for active conversions to complete, reduce concurrency, or raise maxConcurrent settings."
       },
       E_AUTH: {
         code: "E_AUTH",
@@ -613,7 +638,8 @@ var require_security = __commonJS({
     async function safeFetch(url, options = {}) {
       const urlStr = typeof url === "string" ? url : url.toString();
       await validateSafeUrlAsync(urlStr);
-      return fetch(urlStr, {
+      const httpFetch = globalThis.fetch;
+      return httpFetch(urlStr, {
         ...options,
         redirect: "error",
         signal: options.signal || AbortSignal.timeout(1e4)
@@ -633,7 +659,10 @@ var require_security = __commonJS({
 var require_i18n = __commonJS({
   "packages/shared/src/i18n.js"(exports2, module2) {
     "use strict";
-    var SUPPORTED_LOCALES = Object.freeze(["en", "tl"]);
+    var fs = require("node:fs");
+    var path = require("node:path");
+    var DEFAULT_LOCALES = ["en", "tl"];
+    var supportedLocalesSet = new Set(DEFAULT_LOCALES);
     var activeLocale = "en";
     var localeCache = /* @__PURE__ */ new Map();
     localeCache.set("en", {
@@ -666,10 +695,66 @@ var require_i18n = __commonJS({
       "toast.error": "May error: {{message}}",
       "cli.help": "I-convert at i-optimize ang mga format ng imahe mula sa iyong terminal."
     });
+    function loadFilesystemCatalogs() {
+      try {
+        const candidates = [
+          path.resolve(__dirname, "../../../locales"),
+          path.resolve(__dirname, "../../locales"),
+          path.resolve(process.cwd(), "locales")
+        ];
+        let localesDir = null;
+        for (const c of candidates) {
+          if (fs.existsSync(c)) {
+            localesDir = c;
+            break;
+          }
+        }
+        if (!localesDir) return;
+        const entries = fs.readdirSync(localesDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory() && !entry.name.startsWith(".")) {
+            const locale = entry.name.toLowerCase();
+            supportedLocalesSet.add(locale);
+            const subDir = path.join(localesDir, entry.name);
+            const jsonFiles = fs.readdirSync(subDir).filter((f) => f.endsWith(".json"));
+            for (const jf of jsonFiles) {
+              try {
+                const raw = fs.readFileSync(path.join(subDir, jf), "utf8");
+                const data = JSON.parse(raw);
+                if (data && typeof data === "object") {
+                  registerTranslations(locale, data);
+                }
+              } catch {
+              }
+            }
+          }
+        }
+      } catch {
+      }
+    }
+    loadFilesystemCatalogs();
+    var SUPPORTED_LOCALES = new Proxy(DEFAULT_LOCALES, {
+      get(target, prop) {
+        const list = Array.from(supportedLocalesSet);
+        if (prop === "includes") {
+          return (val) => supportedLocalesSet.has(String(val).toLowerCase());
+        }
+        if (prop === "length") {
+          return list.length;
+        }
+        if (typeof prop === "string" && !isNaN(Number(prop))) {
+          return list[Number(prop)];
+        }
+        return Reflect.get(list, prop);
+      }
+    });
+    function getSupportedLocales() {
+      return Array.from(supportedLocalesSet);
+    }
     function setLocale(locale) {
       if (!locale) return;
       const normalized = String(locale).toLowerCase().split(/[-_]/)[0];
-      if (SUPPORTED_LOCALES.includes(normalized)) {
+      if (supportedLocalesSet.has(normalized)) {
         activeLocale = normalized;
       }
     }
@@ -678,8 +763,10 @@ var require_i18n = __commonJS({
     }
     function registerTranslations(locale, strings) {
       if (!locale || !strings || typeof strings !== "object") return;
-      const current = localeCache.get(locale) || {};
-      localeCache.set(locale, { ...current, ...strings });
+      const normalized = String(locale).toLowerCase().split(/[-_]/)[0];
+      supportedLocalesSet.add(normalized);
+      const current = localeCache.get(normalized) || {};
+      localeCache.set(normalized, { ...current, ...strings });
     }
     function t(key, vars = {}) {
       const current = localeCache.get(activeLocale) || {};
@@ -694,10 +781,862 @@ var require_i18n = __commonJS({
     }
     module2.exports = {
       SUPPORTED_LOCALES,
+      getSupportedLocales,
       setLocale,
       getLocale,
       registerTranslations,
       t
+    };
+  }
+});
+
+// packages/shared/src/limits.js
+var require_limits = __commonJS({
+  "packages/shared/src/limits.js"(exports2, module2) {
+    "use strict";
+    var fs = require("node:fs");
+    var path = require("node:path");
+    var { ZapwebpError } = require_errors();
+    var DEFAULT_LIMITS = Object.freeze({
+      maxFilesPerRequest: 20,
+      maxFilesPerSession: 100,
+      maxFilesPerUser: null,
+      maxBytesPerRequest: 104857600,
+      // 100 MB (100 * 1024 * 1024)
+      maxConcurrent: 4,
+      // Backward-compatible alias for concurrency.perRequest
+      concurrency: Object.freeze({
+        perRequest: 4,
+        // Batch worker pool per conversion request
+        perUser: 4,
+        // Max active concurrent conversion requests per user
+        global: 16
+        // Server-wide concurrency ceiling across all users
+      }),
+      rateLimit: Object.freeze({
+        maxRequests: 100,
+        windowMs: 6e4
+        // 1 minute
+      })
+    });
+    function formatBytes(bytes, decimals = 1) {
+      if (bytes === void 0 || bytes === null || isNaN(bytes) || bytes < 0) return "0 B";
+      if (bytes === 0) return "0 B";
+      const k = 1024;
+      const dm = decimals < 0 ? 0 : decimals;
+      const sizes = ["B", "KB", "MB", "GB", "TB"];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      const safeI = Math.min(i, sizes.length - 1);
+      return `${parseFloat((bytes / Math.pow(k, safeI)).toFixed(dm))} ${sizes[safeI]}`;
+    }
+    function resolveLimits(userLimits = {}) {
+      if (!userLimits || typeof userLimits !== "object") {
+        return {
+          ...DEFAULT_LIMITS,
+          concurrency: { ...DEFAULT_LIMITS.concurrency }
+        };
+      }
+      function parseNumberOrNull(val, fallback) {
+        if (val === null || val === "unlimited" || val === Infinity) return null;
+        if (val !== void 0) {
+          const num = Number(val);
+          return Number.isFinite(num) && num >= 0 ? num : fallback;
+        }
+        return fallback;
+      }
+      const maxFilesPerRequest = parseNumberOrNull(
+        userLimits.maxFilesPerRequest,
+        DEFAULT_LIMITS.maxFilesPerRequest
+      );
+      const maxFilesPerSession = parseNumberOrNull(
+        userLimits.maxFilesPerSession,
+        DEFAULT_LIMITS.maxFilesPerSession
+      );
+      const maxFilesPerUser = parseNumberOrNull(
+        userLimits.maxFilesPerUser,
+        DEFAULT_LIMITS.maxFilesPerUser
+      );
+      const maxBytesPerRequest = parseNumberOrNull(
+        userLimits.maxBytesPerRequest,
+        DEFAULT_LIMITS.maxBytesPerRequest
+      );
+      const perRequest = parseNumberOrNull(
+        userLimits.concurrency?.perRequest ?? userLimits.maxConcurrent,
+        DEFAULT_LIMITS.concurrency.perRequest
+      ) || 1;
+      const perUser = parseNumberOrNull(
+        userLimits.concurrency?.perUser,
+        DEFAULT_LIMITS.concurrency.perUser
+      );
+      const global2 = parseNumberOrNull(
+        userLimits.concurrency?.global,
+        DEFAULT_LIMITS.concurrency.global
+      );
+      const concurrency = {
+        perRequest,
+        perUser,
+        global: global2
+      };
+      let rateLimit = DEFAULT_LIMITS.rateLimit;
+      if (userLimits.rateLimit === null || userLimits.rateLimit === "unlimited" || userLimits.rateLimit === false) {
+        rateLimit = null;
+      } else if (userLimits.rateLimit && typeof userLimits.rateLimit === "object") {
+        rateLimit = {
+          maxRequests: parseNumberOrNull(userLimits.rateLimit.maxRequests, 100) || 100,
+          windowMs: parseNumberOrNull(userLimits.rateLimit.windowMs, 6e4) || 6e4
+        };
+      }
+      return {
+        maxFilesPerRequest,
+        maxFilesPerSession,
+        maxFilesPerUser,
+        maxBytesPerRequest,
+        maxConcurrent: perRequest,
+        concurrency,
+        rateLimit
+      };
+    }
+    function evaluateLimits({
+      filesCount = 0,
+      totalBytes = 0,
+      sessionCount = 0,
+      userCount = 0,
+      limits = DEFAULT_LIMITS
+    } = {}) {
+      const resolved = resolveLimits(limits);
+      if (resolved.maxFilesPerRequest !== null && filesCount > resolved.maxFilesPerRequest) {
+        throw new ZapwebpError({
+          code: "E_TOO_MANY_FILES",
+          message: `This batch has ${filesCount} files. The limit is ${resolved.maxFilesPerRequest}.`,
+          fix: `Drop ${resolved.maxFilesPerRequest} or fewer files, or raise the limit in settings.`,
+          suggestedFix: { maxFiles: resolved.maxFilesPerRequest },
+          retryable: true
+        });
+      }
+      if (resolved.maxBytesPerRequest !== null && totalBytes > resolved.maxBytesPerRequest) {
+        throw new ZapwebpError({
+          code: "E_REQUEST_TOO_LARGE",
+          message: `This batch is ${formatBytes(totalBytes)}. The limit is ${formatBytes(resolved.maxBytesPerRequest)}.`,
+          fix: "Reduce the batch size, or raise the limit.",
+          suggestedFix: { maxBytes: resolved.maxBytesPerRequest },
+          retryable: true
+        });
+      }
+      if (resolved.maxFilesPerSession !== null && sessionCount + filesCount > resolved.maxFilesPerSession) {
+        throw new ZapwebpError({
+          code: "E_SESSION_LIMIT_EXCEEDED",
+          message: `Session limit of ${resolved.maxFilesPerSession} files reached. Processed ${sessionCount + filesCount} files in this session.`,
+          fix: "Start a new session with 'zap --reset-session', or raise the limit in .zapwebp/config.json.",
+          retryable: false
+        });
+      }
+      if (resolved.maxFilesPerUser !== null && userCount + filesCount > resolved.maxFilesPerUser) {
+        throw new ZapwebpError({
+          code: "E_USER_LIMIT_EXCEEDED",
+          message: `User limit exceeded. Processed ${userCount + filesCount} files. The user limit is ${resolved.maxFilesPerUser}.`,
+          fix: "Wait for the quota reset period, or raise maxFilesPerUser.",
+          retryable: false
+        });
+      }
+    }
+    function createLimitsMetadata({
+      filesCount = 0,
+      totalBytes = 0,
+      sessionCount = 0,
+      limits = DEFAULT_LIMITS,
+      rateLimit = null,
+      concurrencyStatus = null
+    } = {}) {
+      const resolved = resolveLimits(limits);
+      const remainingFiles = resolved.maxFilesPerRequest !== null ? Math.max(0, resolved.maxFilesPerRequest - filesCount) : null;
+      const remainingBytes = resolved.maxBytesPerRequest !== null ? Math.max(0, resolved.maxBytesPerRequest - totalBytes) : null;
+      const sessionUsed = sessionCount + filesCount;
+      const sessionRemaining = resolved.maxFilesPerSession !== null ? Math.max(0, resolved.maxFilesPerSession - sessionUsed) : null;
+      const metadata = {
+        filesProcessed: filesCount,
+        filesRemaining: remainingFiles,
+        bytesProcessed: totalBytes,
+        bytesRemaining: remainingBytes,
+        maxFilesPerRequest: resolved.maxFilesPerRequest,
+        usedFiles: filesCount,
+        remainingFiles,
+        maxBytesPerRequest: resolved.maxBytesPerRequest,
+        usedBytes: totalBytes,
+        remainingBytes,
+        maxConcurrent: resolved.maxConcurrent,
+        concurrency: {
+          perRequest: resolved.concurrency.perRequest,
+          perUser: resolved.concurrency.perUser,
+          global: resolved.concurrency.global,
+          ...concurrencyStatus && typeof concurrencyStatus === "object" ? concurrencyStatus : {}
+        },
+        session: {
+          maxFilesPerSession: resolved.maxFilesPerSession,
+          usedFiles: sessionUsed,
+          remainingFiles: sessionRemaining
+        }
+      };
+      if (rateLimit && typeof rateLimit === "object") {
+        metadata.rateLimit = rateLimit;
+      }
+      return metadata;
+    }
+    var RateLimitStore = class {
+      get(key, windowMs) {
+        throw new Error("RateLimitStore.get() not implemented");
+      }
+      increment(key, count, windowMs) {
+        throw new Error("RateLimitStore.increment() not implemented");
+      }
+      clear(key) {
+        throw new Error("RateLimitStore.clear() not implemented");
+      }
+    };
+    var MemoryRateLimitStore = class extends RateLimitStore {
+      constructor() {
+        super();
+        this.records = /* @__PURE__ */ new Map();
+      }
+      get(key, windowMs) {
+        const now = Date.now();
+        const entry = this.records.get(key);
+        if (!entry) return null;
+        if (now - entry.windowStart >= windowMs) {
+          this.records.delete(key);
+          return null;
+        }
+        return { count: entry.count, windowStart: entry.windowStart };
+      }
+      increment(key, count, windowMs) {
+        const now = Date.now();
+        let entry = this.records.get(key);
+        if (!entry || now - entry.windowStart >= windowMs) {
+          entry = { windowStart: now, count: 0 };
+          this.records.set(key, entry);
+        }
+        entry.count += count;
+        return { count: entry.count, windowStart: entry.windowStart };
+      }
+      clear(key) {
+        if (key !== void 0) {
+          this.records.delete(key);
+        } else {
+          this.records.clear();
+        }
+      }
+    };
+    var FileRateLimitStore = class extends RateLimitStore {
+      /**
+       * @param {object} [options]
+       * @param {string} [options.filePath] - File path (defaults to .zapwebp/ratelimit.json)
+       */
+      constructor({ filePath = path.join(".zapwebp", "ratelimit.json") } = {}) {
+        super();
+        this.filePath = path.resolve(filePath);
+      }
+      _read() {
+        try {
+          if (!fs.existsSync(this.filePath)) return {};
+          const raw = fs.readFileSync(this.filePath, "utf8");
+          const data = JSON.parse(raw);
+          return data && typeof data === "object" ? data : {};
+        } catch {
+          return {};
+        }
+      }
+      _write(data) {
+        try {
+          const dir = path.dirname(this.filePath);
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+          const tmp = `${this.filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+          fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", "utf8");
+          let renamed = false;
+          for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+              fs.renameSync(tmp, this.filePath);
+              renamed = true;
+              break;
+            } catch {
+              if (attempt === 4) {
+                try {
+                  fs.writeFileSync(this.filePath, JSON.stringify(data, null, 2) + "\n", "utf8");
+                } catch {
+                }
+              }
+            }
+          }
+          try {
+            if (!renamed && fs.existsSync(tmp)) fs.unlinkSync(tmp);
+          } catch {
+          }
+        } catch {
+        }
+      }
+      get(key, windowMs) {
+        const data = this._read();
+        const entry = data[key];
+        if (!entry) return null;
+        const now = Date.now();
+        if (now - entry.windowStart >= windowMs) {
+          delete data[key];
+          this._write(data);
+          return null;
+        }
+        return { count: entry.count, windowStart: entry.windowStart };
+      }
+      increment(key, count, windowMs) {
+        const data = this._read();
+        const now = Date.now();
+        for (const [k, v] of Object.entries(data)) {
+          if (now - v.windowStart >= windowMs) {
+            delete data[k];
+          }
+        }
+        let entry = data[key];
+        if (!entry || now - entry.windowStart >= windowMs) {
+          entry = { windowStart: now, count: 0 };
+          data[key] = entry;
+        }
+        entry.count += count;
+        this._write(data);
+        return { count: entry.count, windowStart: entry.windowStart };
+      }
+      clear(key) {
+        if (key !== void 0) {
+          const data = this._read();
+          delete data[key];
+          this._write(data);
+        } else {
+          try {
+            if (fs.existsSync(this.filePath)) fs.unlinkSync(this.filePath);
+          } catch {
+          }
+        }
+      }
+    };
+    var RateLimiter = class {
+      /**
+       * @param {object} [options]
+       * @param {number} [options.maxRequests=100]
+       * @param {number} [options.windowMs=60000]
+       * @param {RateLimitStore} [options.store]
+       * @param {string} [options.keyPrefix='']
+       */
+      constructor({
+        maxRequests = 100,
+        windowMs = 6e4,
+        store = null,
+        keyPrefix = ""
+      } = {}) {
+        this.maxRequests = maxRequests;
+        this.windowMs = windowMs;
+        this.store = store || new MemoryRateLimitStore();
+        this.keyPrefix = keyPrefix;
+      }
+      _resolveKey(key) {
+        return this.keyPrefix ? `${this.keyPrefix}:${key}` : key;
+      }
+      /**
+       * Checks whether the given key is allowed under rate limits.
+       *
+       * @param {string} [key='default']
+       * @returns {boolean} True if allowed
+       */
+      check(key = "default") {
+        const k = this._resolveKey(key);
+        const entry = this.store.get(k, this.windowMs);
+        if (!entry) return true;
+        return entry.count < this.maxRequests;
+      }
+      /**
+       * Asynchronous rate check (for async multi-instance/distributed stores).
+       * @param {string} [key='default']
+       * @returns {Promise<boolean>}
+       */
+      async checkAsync(key = "default") {
+        const k = this._resolveKey(key);
+        const entry = await this.store.get(k, this.windowMs);
+        if (!entry) return true;
+        return entry.count < this.maxRequests;
+      }
+      /**
+       * Records a request for the key. Throws ZapwebpError if rate limit is exceeded.
+       *
+       * @param {string} [key='default']
+       * @param {number} [count=1]
+       */
+      record(key = "default", count = 1) {
+        const k = this._resolveKey(key);
+        const now = Date.now();
+        const entryBefore = this.store.get(k, this.windowMs);
+        if (entryBefore && entryBefore.count + count > this.maxRequests) {
+          const resetInSec = Math.max(1, Math.ceil((entryBefore.windowStart + this.windowMs - now) / 1e3));
+          throw new ZapwebpError({
+            code: "E_RATE_LIMIT",
+            message: `Too many requests. Try again in ${resetInSec} seconds.`,
+            fix: "Wait, or raise the rate limit.",
+            retryable: true
+          });
+        }
+        const updated = this.store.increment(k, count, this.windowMs);
+        if (updated.count > this.maxRequests) {
+          const resetInSec = Math.max(1, Math.ceil((updated.windowStart + this.windowMs - now) / 1e3));
+          throw new ZapwebpError({
+            code: "E_RATE_LIMIT",
+            message: `Too many requests. Try again in ${resetInSec} seconds.`,
+            fix: "Wait, or raise the rate limit.",
+            retryable: true
+          });
+        }
+      }
+      /**
+       * Asynchronously records a request for the key.
+       * @param {string} [key='default']
+       * @param {number} [count=1]
+       * @returns {Promise<void>}
+       */
+      async recordAsync(key = "default", count = 1) {
+        const k = this._resolveKey(key);
+        const now = Date.now();
+        const entryBefore = await this.store.get(k, this.windowMs);
+        if (entryBefore && entryBefore.count + count > this.maxRequests) {
+          const resetInSec = Math.max(1, Math.ceil((entryBefore.windowStart + this.windowMs - now) / 1e3));
+          throw new ZapwebpError({
+            code: "E_RATE_LIMIT",
+            message: `Too many requests. Try again in ${resetInSec} seconds.`,
+            fix: "Wait, or raise the rate limit.",
+            retryable: true
+          });
+        }
+        const updated = await this.store.increment(k, count, this.windowMs);
+        if (updated.count > this.maxRequests) {
+          const resetInSec = Math.max(1, Math.ceil((updated.windowStart + this.windowMs - now) / 1e3));
+          throw new ZapwebpError({
+            code: "E_RATE_LIMIT",
+            message: `Too many requests. Try again in ${resetInSec} seconds.`,
+            fix: "Wait, or raise the rate limit.",
+            retryable: true
+          });
+        }
+      }
+      /**
+       * Returns remaining requests allowed in current window.
+       *
+       * @param {string} [key='default']
+       * @returns {number}
+       */
+      remaining(key = "default") {
+        const k = this._resolveKey(key);
+        const entry = this.store.get(k, this.windowMs);
+        if (!entry) return this.maxRequests;
+        return Math.max(0, this.maxRequests - entry.count);
+      }
+      /**
+       * Asynchronously returns remaining requests allowed in current window.
+       * @param {string} [key='default']
+       * @returns {Promise<number>}
+       */
+      async remainingAsync(key = "default") {
+        const k = this._resolveKey(key);
+        const entry = await this.store.get(k, this.windowMs);
+        if (!entry) return this.maxRequests;
+        return Math.max(0, this.maxRequests - entry.count);
+      }
+      /**
+       * Returns remaining seconds until the rate limit window resets.
+       *
+       * @param {string} [key='default']
+       * @returns {number} Seconds until reset
+       */
+      resetIn(key = "default") {
+        const k = this._resolveKey(key);
+        const entry = this.store.get(k, this.windowMs);
+        if (!entry) return 0;
+        const now = Date.now();
+        return Math.max(1, Math.ceil((entry.windowStart + this.windowMs - now) / 1e3));
+      }
+      /**
+       * Asynchronously returns remaining seconds until the rate limit window resets.
+       * @param {string} [key='default']
+       * @returns {Promise<number>}
+       */
+      async resetInAsync(key = "default") {
+        const k = this._resolveKey(key);
+        const entry = await this.store.get(k, this.windowMs);
+        if (!entry) return 0;
+        const now = Date.now();
+        return Math.max(1, Math.ceil((entry.windowStart + this.windowMs - now) / 1e3));
+      }
+      /**
+       * Clears rate limit state for key or all keys.
+       * @param {string} [key]
+       */
+      clear(key) {
+        const k = key !== void 0 ? this._resolveKey(key) : void 0;
+        return this.store.clear(k);
+      }
+      /**
+       * Asynchronously clears rate limit state.
+       * @param {string} [key]
+       * @returns {Promise<void>}
+       */
+      async clearAsync(key) {
+        const k = key !== void 0 ? this._resolveKey(key) : void 0;
+        return await this.store.clear(k);
+      }
+    };
+    var ConcurrencyLimiter = class {
+      /**
+       * @param {object} [options]
+       * @param {number|null} [options.perRequest=4]
+       * @param {number|null} [options.perUser=4]
+       * @param {number|null} [options.global=16]
+       * @param {object} [options.concurrency]
+       */
+      constructor(options = {}) {
+        const conf = options.concurrency || options;
+        const parse = (val, def) => {
+          if (val === null || val === "unlimited" || val === Infinity) return null;
+          if (val !== void 0) {
+            const n = Number(val);
+            return Number.isFinite(n) && n >= 0 ? n : def;
+          }
+          return def;
+        };
+        this.perRequest = parse(conf.perRequest ?? options.perRequest, 4);
+        this.perUser = parse(conf.perUser ?? options.perUser, 4);
+        this.global = parse(conf.global ?? options.global, 16);
+        this.activeGlobal = 0;
+        this.activeUsers = /* @__PURE__ */ new Map();
+      }
+      /**
+       * Attempts to acquire execution capacity. Throws E_CONCURRENCY_LIMIT_EXCEEDED if limit is reached.
+       * @param {object} [params]
+       * @param {string} [params.userId='anonymous']
+       * @param {number} [params.count=1]
+       * @returns {{ release: () => void }} Token to release capacity
+       */
+      acquire({ userId = "anonymous", count = 1 } = {}) {
+        if (this.global !== null && this.activeGlobal + count > this.global) {
+          throw new ZapwebpError({
+            code: "E_CONCURRENCY_LIMIT_EXCEEDED",
+            message: `Global concurrency limit of ${this.global} reached. Currently active conversions: ${this.activeGlobal}.`,
+            fix: "Wait for active conversions to finish or raise concurrency.global in settings.",
+            retryable: true
+          });
+        }
+        if (this.perUser !== null) {
+          const userActive = this.activeUsers.get(userId) || 0;
+          if (userActive + count > this.perUser) {
+            throw new ZapwebpError({
+              code: "E_CONCURRENCY_LIMIT_EXCEEDED",
+              message: `User concurrency limit of ${this.perUser} reached for user "${userId}". Currently active conversions: ${userActive}.`,
+              fix: "Wait for your running conversions to complete or raise concurrency.perUser.",
+              retryable: true
+            });
+          }
+        }
+        this.activeGlobal += count;
+        this.activeUsers.set(userId, (this.activeUsers.get(userId) || 0) + count);
+        let released = false;
+        return {
+          release: () => {
+            if (!released) {
+              released = true;
+              this.release({ userId, count });
+            }
+          }
+        };
+      }
+      /**
+       * Releases active execution capacity.
+       * @param {object} [params]
+       * @param {string} [params.userId='anonymous']
+       * @param {number} [params.count=1]
+       */
+      release({ userId = "anonymous", count = 1 } = {}) {
+        this.activeGlobal = Math.max(0, this.activeGlobal - count);
+        const userActive = this.activeUsers.get(userId) || 0;
+        const nextUser = Math.max(0, userActive - count);
+        if (nextUser <= 0) {
+          this.activeUsers.delete(userId);
+        } else {
+          this.activeUsers.set(userId, nextUser);
+        }
+      }
+      /**
+       * Executes task with automatic acquire and release in finally.
+       * @param {() => Promise<any>} taskFn
+       * @param {object} [params]
+       * @param {string} [params.userId='anonymous']
+       * @param {number} [params.count=1]
+       * @returns {Promise<any>}
+       */
+      async run(taskFn, { userId = "anonymous", count = 1 } = {}) {
+        const token = this.acquire({ userId, count });
+        try {
+          return await taskFn();
+        } finally {
+          token.release();
+        }
+      }
+      /**
+       * Retrieves active concurrency status.
+       * @param {object} [params]
+       * @param {string} [params.userId='anonymous']
+       * @returns {object}
+       */
+      getStatus({ userId = "anonymous" } = {}) {
+        return {
+          activeGlobal: this.activeGlobal,
+          maxGlobal: this.global,
+          activeUser: this.activeUsers.get(userId) || 0,
+          maxUser: this.perUser,
+          perRequest: this.perRequest
+        };
+      }
+    };
+    module2.exports = {
+      DEFAULT_LIMITS,
+      resolveLimits,
+      formatBytes,
+      evaluateLimits,
+      createLimitsMetadata,
+      RateLimitStore,
+      MemoryRateLimitStore,
+      FileRateLimitStore,
+      RateLimiter,
+      ConcurrencyLimiter
+    };
+  }
+});
+
+// packages/shared/src/session.js
+var require_session = __commonJS({
+  "packages/shared/src/session.js"(exports2, module2) {
+    "use strict";
+    var fs = require("node:fs");
+    var path = require("node:path");
+    var crypto = require("node:crypto");
+    var { ZapwebpError } = require_errors();
+    function generateSessionId() {
+      return `zap-sess-${crypto.randomUUID()}`;
+    }
+    var SessionState = class {
+      constructor({
+        sessionId = null,
+        surface = "generic",
+        createdAt = null,
+        updatedAt = null,
+        expiresAt = null,
+        filesProcessed = 0,
+        bytesProcessed = 0,
+        requestsCount = 0
+      } = {}) {
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        this.sessionId = sessionId || generateSessionId();
+        this.surface = surface;
+        this.createdAt = createdAt || now;
+        this.updatedAt = updatedAt || now;
+        this.expiresAt = expiresAt || null;
+        this.filesProcessed = Number.isFinite(filesProcessed) && filesProcessed >= 0 ? filesProcessed : 0;
+        this.bytesProcessed = Number.isFinite(bytesProcessed) && bytesProcessed >= 0 ? bytesProcessed : 0;
+        this.requestsCount = Number.isFinite(requestsCount) && requestsCount >= 0 ? requestsCount : 0;
+      }
+      toJSON() {
+        return {
+          sessionId: this.sessionId,
+          surface: this.surface,
+          createdAt: this.createdAt,
+          updatedAt: this.updatedAt,
+          expiresAt: this.expiresAt,
+          filesProcessed: this.filesProcessed,
+          bytesProcessed: this.bytesProcessed,
+          requestsCount: this.requestsCount
+        };
+      }
+    };
+    var MemorySessionStore = class {
+      constructor(initialState = null) {
+        this.session = initialState ? new SessionState(initialState) : null;
+      }
+      load() {
+        return this.session;
+      }
+      save(session) {
+        this.session = session;
+      }
+      clear() {
+        this.session = null;
+      }
+    };
+    var FileSessionStore = class {
+      constructor({ filePath = path.join(".zapwebp", "session.json") } = {}) {
+        this.filePath = path.resolve(filePath);
+      }
+      load() {
+        try {
+          if (!fs.existsSync(this.filePath)) return null;
+          const raw = fs.readFileSync(this.filePath, "utf8");
+          const data = JSON.parse(raw);
+          return new SessionState(data);
+        } catch {
+          return null;
+        }
+      }
+      save(session) {
+        try {
+          const dir = path.dirname(this.filePath);
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+          const tmp = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
+          fs.writeFileSync(tmp, JSON.stringify(session.toJSON(), null, 2) + "\n", "utf8");
+          fs.renameSync(tmp, this.filePath);
+        } catch {
+        }
+      }
+      clear() {
+        try {
+          if (fs.existsSync(this.filePath)) fs.unlinkSync(this.filePath);
+        } catch {
+        }
+      }
+    };
+    var WebSessionStore = class {
+      constructor({ storageKey = "zapwebp_session_v1" } = {}) {
+        this.storageKey = storageKey;
+        this.fallback = new MemorySessionStore();
+      }
+      load() {
+        try {
+          if (typeof sessionStorage !== "undefined") {
+            const raw = sessionStorage.getItem(this.storageKey);
+            if (raw) return new SessionState(JSON.parse(raw));
+          }
+        } catch {
+        }
+        return this.fallback.load();
+      }
+      save(session) {
+        try {
+          if (typeof sessionStorage !== "undefined") {
+            sessionStorage.setItem(this.storageKey, JSON.stringify(session.toJSON()));
+            return;
+          }
+        } catch {
+        }
+        this.fallback.save(session);
+      }
+      clear() {
+        try {
+          if (typeof sessionStorage !== "undefined") {
+            sessionStorage.removeItem(this.storageKey);
+            return;
+          }
+        } catch {
+        }
+        this.fallback.clear();
+      }
+    };
+    var SessionManager = class {
+      /**
+       * @param {object} [options]
+       * @param {string} [options.surface='generic'] - 'web' | 'cli' | 'mcp' | 'sdk' | 'storage'
+       * @param {object} [options.store] - Store instance (MemorySessionStore, FileSessionStore, WebSessionStore)
+       * @param {number|null} [options.ttlMs=86400000] - 24 hour rolling TTL default
+       */
+      constructor({
+        surface = "generic",
+        store = null,
+        ttlMs = 864e5
+        // 24 hours
+      } = {}) {
+        this.surface = surface;
+        this.ttlMs = ttlMs;
+        this.store = store || new MemorySessionStore();
+      }
+      /**
+       * Loads current session or creates a new one if expired or absent.
+       * @returns {SessionState}
+       */
+      getSession() {
+        let session = this.store.load();
+        const now = Date.now();
+        if (session) {
+          if (session.expiresAt && now > new Date(session.expiresAt).getTime()) {
+            session = null;
+          }
+        }
+        if (!session) {
+          const expiresAt = this.ttlMs ? new Date(now + this.ttlMs).toISOString() : null;
+          session = new SessionState({
+            surface: this.surface,
+            expiresAt
+          });
+          this.store.save(session);
+        }
+        return session;
+      }
+      /**
+       * Checks if adding count files would exceed maxFilesPerSession.
+       * @param {number} count
+       * @param {number|null} maxFilesPerSession
+       * @returns {boolean}
+       */
+      canProcess(count = 1, maxFilesPerSession = null) {
+        if (maxFilesPerSession === null) return true;
+        const session = this.getSession();
+        return session.filesProcessed + count <= maxFilesPerSession;
+      }
+      /**
+       * Records newly processed files and bytes. Throws E_SESSION_LIMIT_EXCEEDED if limit would be breached.
+       * @param {object} params
+       * @param {number} [params.filesCount=1]
+       * @param {number} [params.bytesCount=0]
+       * @param {number|null} [params.maxFilesPerSession=null]
+       * @returns {SessionState}
+       */
+      record({ filesCount = 1, bytesCount = 0, maxFilesPerSession = null } = {}) {
+        const session = this.getSession();
+        if (maxFilesPerSession !== null && session.filesProcessed + filesCount > maxFilesPerSession) {
+          throw new ZapwebpError({
+            code: "E_SESSION_LIMIT_EXCEEDED",
+            message: `Session limit of ${maxFilesPerSession} files reached. Processed ${session.filesProcessed + filesCount} files in this session.`,
+            fix: this.surface === "cli" ? "Start a new session with 'zap --reset-session', or raise the limit in .zapwebp/config.json." : "Close and re-open the session, or raise the limit in settings.",
+            retryable: false
+          });
+        }
+        session.filesProcessed += filesCount;
+        session.bytesProcessed += bytesCount;
+        session.requestsCount += 1;
+        session.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+        if (this.ttlMs) {
+          session.expiresAt = new Date(Date.now() + this.ttlMs).toISOString();
+        }
+        this.store.save(session);
+        return session;
+      }
+      /**
+       * Resets the active session to 0 with a new sessionId.
+       * @returns {SessionState}
+       */
+      reset() {
+        const now = Date.now();
+        const expiresAt = this.ttlMs ? new Date(now + this.ttlMs).toISOString() : null;
+        const session = new SessionState({
+          surface: this.surface,
+          expiresAt
+        });
+        this.store.save(session);
+        return session;
+      }
+    };
+    module2.exports = {
+      generateSessionId,
+      SessionState,
+      SessionManager,
+      MemorySessionStore,
+      FileSessionStore,
+      WebSessionStore
     };
   }
 });
@@ -1536,6 +2475,26 @@ var require_src = __commonJS({
       const cleaned = routePath.startsWith("/") ? routePath : `/${routePath}`;
       return `${APP_ORIGIN}${cleaned}`;
     }
+    var {
+      DEFAULT_LIMITS,
+      resolveLimits,
+      formatBytes,
+      evaluateLimits,
+      createLimitsMetadata,
+      RateLimiter,
+      RateLimitStore,
+      MemoryRateLimitStore,
+      FileRateLimitStore,
+      ConcurrencyLimiter
+    } = require_limits();
+    var {
+      generateSessionId,
+      SessionState,
+      SessionManager,
+      MemorySessionStore,
+      FileSessionStore,
+      WebSessionStore
+    } = require_session();
     module2.exports = {
       APP_ORIGIN,
       DEFAULT_PORT,
@@ -1548,6 +2507,22 @@ var require_src = __commonJS({
       ZAPWEBP_USER_AGENT,
       DEFAULT_OPTIONS,
       DEFAULT_CONVERSION_POLICY,
+      DEFAULT_LIMITS,
+      resolveLimits,
+      formatBytes,
+      evaluateLimits,
+      createLimitsMetadata,
+      RateLimiter,
+      RateLimitStore,
+      MemoryRateLimitStore,
+      FileRateLimitStore,
+      ConcurrencyLimiter,
+      generateSessionId,
+      SessionState,
+      SessionManager,
+      MemorySessionStore,
+      FileSessionStore,
+      WebSessionStore,
       ERROR_CATALOG,
       ZapwebpError,
       i18n,
@@ -2108,7 +3083,12 @@ var require_chunk_stripper = __commonJS({
         } else if (marker === 237) {
           drop = true;
         } else if (marker === 254) {
-          drop = true;
+          const payload = buf.subarray(offset + 2, segEnd).toString("utf8");
+          if (payload.startsWith("zapwebp:lock:") || payload.startsWith("zapwebp:custom:")) {
+            drop = false;
+          } else {
+            drop = true;
+          }
         }
         if (!drop) {
           chunks.push(buf.subarray(offset - 2, segEnd));
@@ -2164,7 +3144,14 @@ var require_chunk_stripper = __commonJS({
         const type = buf.toString("ascii", offset + 4, offset + 8);
         const chunkEnd = offset + 12 + length;
         if (chunkEnd > buf.length) break;
-        if (type === "eXIf" || type === "tEXt" || type === "iTXt" || type === "zTXt" || type === "tIME" || type === "pHYs" || type === "iCCP" && !keepIcc) {
+        if (type === "eXIf" || type === "zTXt" || type === "tIME" || type === "pHYs" || type === "iCCP" && !keepIcc) {
+        } else if (type === "tEXt" || type === "iTXt") {
+          const chunkData = buf.subarray(offset + 8, chunkEnd);
+          const nullIdx = chunkData.indexOf(0);
+          const keyword = nullIdx !== -1 ? chunkData.subarray(0, nullIdx).toString("latin1") : "";
+          if (keyword === "zapwebp:lock" || keyword === "zapwebp:custom") {
+            kept.push(buf.subarray(offset, chunkEnd));
+          }
         } else {
           kept.push(buf.subarray(offset, chunkEnd));
         }
@@ -2176,7 +3163,7 @@ var require_chunk_stripper = __commonJS({
       if (!Buffer.isBuffer(buf)) return buf;
       const str = buf.toString("utf8");
       if (!str.includes("<svg")) return buf;
-      const cleaned = str.replace(/<metadata[\s\S]*?<\/metadata>/gi, "").replace(/<rdf:RDF[\s\S]*?<\/rdf:RDF>/gi, "");
+      const cleaned = str.replace(/<metadata(?!\s+id="zapwebp-(?:lock|custom)")[\s\S]*?<\/metadata>/gi, "").replace(/<rdf:RDF[\s\S]*?<\/rdf:RDF>/gi, "");
       return Buffer.from(cleaned, "utf8");
     }
     function stripContainerMetadata(bytes, options = {}) {

@@ -1205,7 +1205,32 @@ var require_errors = __commonJS({
       E_RATE_LIMIT: {
         code: "E_RATE_LIMIT",
         message: "Too many requests. Rate limit threshold exceeded.",
-        fix: "Wait a few moments before submitting additional requests."
+        fix: "Wait a few moments before submitting additional requests, or raise the rate limit."
+      },
+      E_TOO_MANY_FILES: {
+        code: "E_TOO_MANY_FILES",
+        message: "This batch has exceeded the maximum allowed number of files.",
+        fix: "Drop fewer files, or raise the maxFilesPerRequest limit."
+      },
+      E_REQUEST_TOO_LARGE: {
+        code: "E_REQUEST_TOO_LARGE",
+        message: "This batch has exceeded the maximum allowed byte size.",
+        fix: "Reduce the batch size, or raise the maxBytesPerRequest limit."
+      },
+      E_SESSION_LIMIT_EXCEEDED: {
+        code: "E_SESSION_LIMIT_EXCEEDED",
+        message: "The current session has reached its maximum file processing limit.",
+        fix: "Start a new session or raise maxFilesPerSession."
+      },
+      E_USER_LIMIT_EXCEEDED: {
+        code: "E_USER_LIMIT_EXCEEDED",
+        message: "The user account has exceeded its allocated file limit for this period.",
+        fix: "Wait for the quota reset period or raise maxFilesPerUser."
+      },
+      E_CONCURRENCY_LIMIT_EXCEEDED: {
+        code: "E_CONCURRENCY_LIMIT_EXCEEDED",
+        message: "Concurrency limit exceeded. Too many conversions are active simultaneously.",
+        fix: "Wait for active conversions to complete, reduce concurrency, or raise maxConcurrent settings."
       },
       E_AUTH: {
         code: "E_AUTH",
@@ -1348,7 +1373,8 @@ var require_security = __commonJS({
     async function safeFetch(url, options = {}) {
       const urlStr = typeof url === "string" ? url : url.toString();
       await validateSafeUrlAsync(urlStr);
-      return fetch(urlStr, {
+      const httpFetch = globalThis.fetch;
+      return httpFetch(urlStr, {
         ...options,
         redirect: "error",
         signal: options.signal || AbortSignal.timeout(1e4)
@@ -1368,7 +1394,10 @@ var require_security = __commonJS({
 var require_i18n = __commonJS({
   "packages/shared/src/i18n.js"(exports2, module2) {
     "use strict";
-    var SUPPORTED_LOCALES = Object.freeze(["en", "tl"]);
+    var fs2 = require("node:fs");
+    var path8 = require("node:path");
+    var DEFAULT_LOCALES = ["en", "tl"];
+    var supportedLocalesSet = new Set(DEFAULT_LOCALES);
     var activeLocale = "en";
     var localeCache = /* @__PURE__ */ new Map();
     localeCache.set("en", {
@@ -1401,10 +1430,66 @@ var require_i18n = __commonJS({
       "toast.error": "May error: {{message}}",
       "cli.help": "I-convert at i-optimize ang mga format ng imahe mula sa iyong terminal."
     });
+    function loadFilesystemCatalogs() {
+      try {
+        const candidates = [
+          path8.resolve(__dirname, "../../../locales"),
+          path8.resolve(__dirname, "../../locales"),
+          path8.resolve(process.cwd(), "locales")
+        ];
+        let localesDir = null;
+        for (const c of candidates) {
+          if (fs2.existsSync(c)) {
+            localesDir = c;
+            break;
+          }
+        }
+        if (!localesDir) return;
+        const entries = fs2.readdirSync(localesDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory() && !entry.name.startsWith(".")) {
+            const locale = entry.name.toLowerCase();
+            supportedLocalesSet.add(locale);
+            const subDir = path8.join(localesDir, entry.name);
+            const jsonFiles = fs2.readdirSync(subDir).filter((f) => f.endsWith(".json"));
+            for (const jf of jsonFiles) {
+              try {
+                const raw = fs2.readFileSync(path8.join(subDir, jf), "utf8");
+                const data = JSON.parse(raw);
+                if (data && typeof data === "object") {
+                  registerTranslations(locale, data);
+                }
+              } catch {
+              }
+            }
+          }
+        }
+      } catch {
+      }
+    }
+    loadFilesystemCatalogs();
+    var SUPPORTED_LOCALES = new Proxy(DEFAULT_LOCALES, {
+      get(target, prop) {
+        const list = Array.from(supportedLocalesSet);
+        if (prop === "includes") {
+          return (val) => supportedLocalesSet.has(String(val).toLowerCase());
+        }
+        if (prop === "length") {
+          return list.length;
+        }
+        if (typeof prop === "string" && !isNaN(Number(prop))) {
+          return list[Number(prop)];
+        }
+        return Reflect.get(list, prop);
+      }
+    });
+    function getSupportedLocales() {
+      return Array.from(supportedLocalesSet);
+    }
     function setLocale2(locale) {
       if (!locale) return;
       const normalized = String(locale).toLowerCase().split(/[-_]/)[0];
-      if (SUPPORTED_LOCALES.includes(normalized)) {
+      if (supportedLocalesSet.has(normalized)) {
         activeLocale = normalized;
       }
     }
@@ -1413,8 +1498,10 @@ var require_i18n = __commonJS({
     }
     function registerTranslations(locale, strings) {
       if (!locale || !strings || typeof strings !== "object") return;
-      const current = localeCache.get(locale) || {};
-      localeCache.set(locale, { ...current, ...strings });
+      const normalized = String(locale).toLowerCase().split(/[-_]/)[0];
+      supportedLocalesSet.add(normalized);
+      const current = localeCache.get(normalized) || {};
+      localeCache.set(normalized, { ...current, ...strings });
     }
     function t2(key, vars = {}) {
       const current = localeCache.get(activeLocale) || {};
@@ -1429,10 +1516,862 @@ var require_i18n = __commonJS({
     }
     module2.exports = {
       SUPPORTED_LOCALES,
+      getSupportedLocales,
       setLocale: setLocale2,
       getLocale,
       registerTranslations,
       t: t2
+    };
+  }
+});
+
+// packages/shared/src/limits.js
+var require_limits = __commonJS({
+  "packages/shared/src/limits.js"(exports2, module2) {
+    "use strict";
+    var fs2 = require("node:fs");
+    var path8 = require("node:path");
+    var { ZapwebpError: ZapwebpError3 } = require_errors();
+    var DEFAULT_LIMITS3 = Object.freeze({
+      maxFilesPerRequest: 20,
+      maxFilesPerSession: 100,
+      maxFilesPerUser: null,
+      maxBytesPerRequest: 104857600,
+      // 100 MB (100 * 1024 * 1024)
+      maxConcurrent: 4,
+      // Backward-compatible alias for concurrency.perRequest
+      concurrency: Object.freeze({
+        perRequest: 4,
+        // Batch worker pool per conversion request
+        perUser: 4,
+        // Max active concurrent conversion requests per user
+        global: 16
+        // Server-wide concurrency ceiling across all users
+      }),
+      rateLimit: Object.freeze({
+        maxRequests: 100,
+        windowMs: 6e4
+        // 1 minute
+      })
+    });
+    function formatBytes2(bytes, decimals = 1) {
+      if (bytes === void 0 || bytes === null || isNaN(bytes) || bytes < 0) return "0 B";
+      if (bytes === 0) return "0 B";
+      const k = 1024;
+      const dm = decimals < 0 ? 0 : decimals;
+      const sizes = ["B", "KB", "MB", "GB", "TB"];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      const safeI = Math.min(i, sizes.length - 1);
+      return `${parseFloat((bytes / Math.pow(k, safeI)).toFixed(dm))} ${sizes[safeI]}`;
+    }
+    function resolveLimits2(userLimits = {}) {
+      if (!userLimits || typeof userLimits !== "object") {
+        return {
+          ...DEFAULT_LIMITS3,
+          concurrency: { ...DEFAULT_LIMITS3.concurrency }
+        };
+      }
+      function parseNumberOrNull(val, fallback) {
+        if (val === null || val === "unlimited" || val === Infinity) return null;
+        if (val !== void 0) {
+          const num = Number(val);
+          return Number.isFinite(num) && num >= 0 ? num : fallback;
+        }
+        return fallback;
+      }
+      const maxFilesPerRequest = parseNumberOrNull(
+        userLimits.maxFilesPerRequest,
+        DEFAULT_LIMITS3.maxFilesPerRequest
+      );
+      const maxFilesPerSession = parseNumberOrNull(
+        userLimits.maxFilesPerSession,
+        DEFAULT_LIMITS3.maxFilesPerSession
+      );
+      const maxFilesPerUser = parseNumberOrNull(
+        userLimits.maxFilesPerUser,
+        DEFAULT_LIMITS3.maxFilesPerUser
+      );
+      const maxBytesPerRequest = parseNumberOrNull(
+        userLimits.maxBytesPerRequest,
+        DEFAULT_LIMITS3.maxBytesPerRequest
+      );
+      const perRequest = parseNumberOrNull(
+        userLimits.concurrency?.perRequest ?? userLimits.maxConcurrent,
+        DEFAULT_LIMITS3.concurrency.perRequest
+      ) || 1;
+      const perUser = parseNumberOrNull(
+        userLimits.concurrency?.perUser,
+        DEFAULT_LIMITS3.concurrency.perUser
+      );
+      const global2 = parseNumberOrNull(
+        userLimits.concurrency?.global,
+        DEFAULT_LIMITS3.concurrency.global
+      );
+      const concurrency = {
+        perRequest,
+        perUser,
+        global: global2
+      };
+      let rateLimit = DEFAULT_LIMITS3.rateLimit;
+      if (userLimits.rateLimit === null || userLimits.rateLimit === "unlimited" || userLimits.rateLimit === false) {
+        rateLimit = null;
+      } else if (userLimits.rateLimit && typeof userLimits.rateLimit === "object") {
+        rateLimit = {
+          maxRequests: parseNumberOrNull(userLimits.rateLimit.maxRequests, 100) || 100,
+          windowMs: parseNumberOrNull(userLimits.rateLimit.windowMs, 6e4) || 6e4
+        };
+      }
+      return {
+        maxFilesPerRequest,
+        maxFilesPerSession,
+        maxFilesPerUser,
+        maxBytesPerRequest,
+        maxConcurrent: perRequest,
+        concurrency,
+        rateLimit
+      };
+    }
+    function evaluateLimits2({
+      filesCount = 0,
+      totalBytes = 0,
+      sessionCount = 0,
+      userCount = 0,
+      limits = DEFAULT_LIMITS3
+    } = {}) {
+      const resolved = resolveLimits2(limits);
+      if (resolved.maxFilesPerRequest !== null && filesCount > resolved.maxFilesPerRequest) {
+        throw new ZapwebpError3({
+          code: "E_TOO_MANY_FILES",
+          message: `This batch has ${filesCount} files. The limit is ${resolved.maxFilesPerRequest}.`,
+          fix: `Drop ${resolved.maxFilesPerRequest} or fewer files, or raise the limit in settings.`,
+          suggestedFix: { maxFiles: resolved.maxFilesPerRequest },
+          retryable: true
+        });
+      }
+      if (resolved.maxBytesPerRequest !== null && totalBytes > resolved.maxBytesPerRequest) {
+        throw new ZapwebpError3({
+          code: "E_REQUEST_TOO_LARGE",
+          message: `This batch is ${formatBytes2(totalBytes)}. The limit is ${formatBytes2(resolved.maxBytesPerRequest)}.`,
+          fix: "Reduce the batch size, or raise the limit.",
+          suggestedFix: { maxBytes: resolved.maxBytesPerRequest },
+          retryable: true
+        });
+      }
+      if (resolved.maxFilesPerSession !== null && sessionCount + filesCount > resolved.maxFilesPerSession) {
+        throw new ZapwebpError3({
+          code: "E_SESSION_LIMIT_EXCEEDED",
+          message: `Session limit of ${resolved.maxFilesPerSession} files reached. Processed ${sessionCount + filesCount} files in this session.`,
+          fix: "Start a new session with 'zap --reset-session', or raise the limit in .zapwebp/config.json.",
+          retryable: false
+        });
+      }
+      if (resolved.maxFilesPerUser !== null && userCount + filesCount > resolved.maxFilesPerUser) {
+        throw new ZapwebpError3({
+          code: "E_USER_LIMIT_EXCEEDED",
+          message: `User limit exceeded. Processed ${userCount + filesCount} files. The user limit is ${resolved.maxFilesPerUser}.`,
+          fix: "Wait for the quota reset period, or raise maxFilesPerUser.",
+          retryable: false
+        });
+      }
+    }
+    function createLimitsMetadata2({
+      filesCount = 0,
+      totalBytes = 0,
+      sessionCount = 0,
+      limits = DEFAULT_LIMITS3,
+      rateLimit = null,
+      concurrencyStatus = null
+    } = {}) {
+      const resolved = resolveLimits2(limits);
+      const remainingFiles = resolved.maxFilesPerRequest !== null ? Math.max(0, resolved.maxFilesPerRequest - filesCount) : null;
+      const remainingBytes = resolved.maxBytesPerRequest !== null ? Math.max(0, resolved.maxBytesPerRequest - totalBytes) : null;
+      const sessionUsed = sessionCount + filesCount;
+      const sessionRemaining = resolved.maxFilesPerSession !== null ? Math.max(0, resolved.maxFilesPerSession - sessionUsed) : null;
+      const metadata = {
+        filesProcessed: filesCount,
+        filesRemaining: remainingFiles,
+        bytesProcessed: totalBytes,
+        bytesRemaining: remainingBytes,
+        maxFilesPerRequest: resolved.maxFilesPerRequest,
+        usedFiles: filesCount,
+        remainingFiles,
+        maxBytesPerRequest: resolved.maxBytesPerRequest,
+        usedBytes: totalBytes,
+        remainingBytes,
+        maxConcurrent: resolved.maxConcurrent,
+        concurrency: {
+          perRequest: resolved.concurrency.perRequest,
+          perUser: resolved.concurrency.perUser,
+          global: resolved.concurrency.global,
+          ...concurrencyStatus && typeof concurrencyStatus === "object" ? concurrencyStatus : {}
+        },
+        session: {
+          maxFilesPerSession: resolved.maxFilesPerSession,
+          usedFiles: sessionUsed,
+          remainingFiles: sessionRemaining
+        }
+      };
+      if (rateLimit && typeof rateLimit === "object") {
+        metadata.rateLimit = rateLimit;
+      }
+      return metadata;
+    }
+    var RateLimitStore = class {
+      get(key, windowMs) {
+        throw new Error("RateLimitStore.get() not implemented");
+      }
+      increment(key, count, windowMs) {
+        throw new Error("RateLimitStore.increment() not implemented");
+      }
+      clear(key) {
+        throw new Error("RateLimitStore.clear() not implemented");
+      }
+    };
+    var MemoryRateLimitStore = class extends RateLimitStore {
+      constructor() {
+        super();
+        this.records = /* @__PURE__ */ new Map();
+      }
+      get(key, windowMs) {
+        const now = Date.now();
+        const entry = this.records.get(key);
+        if (!entry) return null;
+        if (now - entry.windowStart >= windowMs) {
+          this.records.delete(key);
+          return null;
+        }
+        return { count: entry.count, windowStart: entry.windowStart };
+      }
+      increment(key, count, windowMs) {
+        const now = Date.now();
+        let entry = this.records.get(key);
+        if (!entry || now - entry.windowStart >= windowMs) {
+          entry = { windowStart: now, count: 0 };
+          this.records.set(key, entry);
+        }
+        entry.count += count;
+        return { count: entry.count, windowStart: entry.windowStart };
+      }
+      clear(key) {
+        if (key !== void 0) {
+          this.records.delete(key);
+        } else {
+          this.records.clear();
+        }
+      }
+    };
+    var FileRateLimitStore = class extends RateLimitStore {
+      /**
+       * @param {object} [options]
+       * @param {string} [options.filePath] - File path (defaults to .zapwebp/ratelimit.json)
+       */
+      constructor({ filePath = path8.join(".zapwebp", "ratelimit.json") } = {}) {
+        super();
+        this.filePath = path8.resolve(filePath);
+      }
+      _read() {
+        try {
+          if (!fs2.existsSync(this.filePath)) return {};
+          const raw = fs2.readFileSync(this.filePath, "utf8");
+          const data = JSON.parse(raw);
+          return data && typeof data === "object" ? data : {};
+        } catch {
+          return {};
+        }
+      }
+      _write(data) {
+        try {
+          const dir = path8.dirname(this.filePath);
+          if (!fs2.existsSync(dir)) fs2.mkdirSync(dir, { recursive: true });
+          const tmp = `${this.filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+          fs2.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", "utf8");
+          let renamed = false;
+          for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+              fs2.renameSync(tmp, this.filePath);
+              renamed = true;
+              break;
+            } catch {
+              if (attempt === 4) {
+                try {
+                  fs2.writeFileSync(this.filePath, JSON.stringify(data, null, 2) + "\n", "utf8");
+                } catch {
+                }
+              }
+            }
+          }
+          try {
+            if (!renamed && fs2.existsSync(tmp)) fs2.unlinkSync(tmp);
+          } catch {
+          }
+        } catch {
+        }
+      }
+      get(key, windowMs) {
+        const data = this._read();
+        const entry = data[key];
+        if (!entry) return null;
+        const now = Date.now();
+        if (now - entry.windowStart >= windowMs) {
+          delete data[key];
+          this._write(data);
+          return null;
+        }
+        return { count: entry.count, windowStart: entry.windowStart };
+      }
+      increment(key, count, windowMs) {
+        const data = this._read();
+        const now = Date.now();
+        for (const [k, v] of Object.entries(data)) {
+          if (now - v.windowStart >= windowMs) {
+            delete data[k];
+          }
+        }
+        let entry = data[key];
+        if (!entry || now - entry.windowStart >= windowMs) {
+          entry = { windowStart: now, count: 0 };
+          data[key] = entry;
+        }
+        entry.count += count;
+        this._write(data);
+        return { count: entry.count, windowStart: entry.windowStart };
+      }
+      clear(key) {
+        if (key !== void 0) {
+          const data = this._read();
+          delete data[key];
+          this._write(data);
+        } else {
+          try {
+            if (fs2.existsSync(this.filePath)) fs2.unlinkSync(this.filePath);
+          } catch {
+          }
+        }
+      }
+    };
+    var RateLimiter = class {
+      /**
+       * @param {object} [options]
+       * @param {number} [options.maxRequests=100]
+       * @param {number} [options.windowMs=60000]
+       * @param {RateLimitStore} [options.store]
+       * @param {string} [options.keyPrefix='']
+       */
+      constructor({
+        maxRequests = 100,
+        windowMs = 6e4,
+        store = null,
+        keyPrefix = ""
+      } = {}) {
+        this.maxRequests = maxRequests;
+        this.windowMs = windowMs;
+        this.store = store || new MemoryRateLimitStore();
+        this.keyPrefix = keyPrefix;
+      }
+      _resolveKey(key) {
+        return this.keyPrefix ? `${this.keyPrefix}:${key}` : key;
+      }
+      /**
+       * Checks whether the given key is allowed under rate limits.
+       *
+       * @param {string} [key='default']
+       * @returns {boolean} True if allowed
+       */
+      check(key = "default") {
+        const k = this._resolveKey(key);
+        const entry = this.store.get(k, this.windowMs);
+        if (!entry) return true;
+        return entry.count < this.maxRequests;
+      }
+      /**
+       * Asynchronous rate check (for async multi-instance/distributed stores).
+       * @param {string} [key='default']
+       * @returns {Promise<boolean>}
+       */
+      async checkAsync(key = "default") {
+        const k = this._resolveKey(key);
+        const entry = await this.store.get(k, this.windowMs);
+        if (!entry) return true;
+        return entry.count < this.maxRequests;
+      }
+      /**
+       * Records a request for the key. Throws ZapwebpError if rate limit is exceeded.
+       *
+       * @param {string} [key='default']
+       * @param {number} [count=1]
+       */
+      record(key = "default", count = 1) {
+        const k = this._resolveKey(key);
+        const now = Date.now();
+        const entryBefore = this.store.get(k, this.windowMs);
+        if (entryBefore && entryBefore.count + count > this.maxRequests) {
+          const resetInSec = Math.max(1, Math.ceil((entryBefore.windowStart + this.windowMs - now) / 1e3));
+          throw new ZapwebpError3({
+            code: "E_RATE_LIMIT",
+            message: `Too many requests. Try again in ${resetInSec} seconds.`,
+            fix: "Wait, or raise the rate limit.",
+            retryable: true
+          });
+        }
+        const updated = this.store.increment(k, count, this.windowMs);
+        if (updated.count > this.maxRequests) {
+          const resetInSec = Math.max(1, Math.ceil((updated.windowStart + this.windowMs - now) / 1e3));
+          throw new ZapwebpError3({
+            code: "E_RATE_LIMIT",
+            message: `Too many requests. Try again in ${resetInSec} seconds.`,
+            fix: "Wait, or raise the rate limit.",
+            retryable: true
+          });
+        }
+      }
+      /**
+       * Asynchronously records a request for the key.
+       * @param {string} [key='default']
+       * @param {number} [count=1]
+       * @returns {Promise<void>}
+       */
+      async recordAsync(key = "default", count = 1) {
+        const k = this._resolveKey(key);
+        const now = Date.now();
+        const entryBefore = await this.store.get(k, this.windowMs);
+        if (entryBefore && entryBefore.count + count > this.maxRequests) {
+          const resetInSec = Math.max(1, Math.ceil((entryBefore.windowStart + this.windowMs - now) / 1e3));
+          throw new ZapwebpError3({
+            code: "E_RATE_LIMIT",
+            message: `Too many requests. Try again in ${resetInSec} seconds.`,
+            fix: "Wait, or raise the rate limit.",
+            retryable: true
+          });
+        }
+        const updated = await this.store.increment(k, count, this.windowMs);
+        if (updated.count > this.maxRequests) {
+          const resetInSec = Math.max(1, Math.ceil((updated.windowStart + this.windowMs - now) / 1e3));
+          throw new ZapwebpError3({
+            code: "E_RATE_LIMIT",
+            message: `Too many requests. Try again in ${resetInSec} seconds.`,
+            fix: "Wait, or raise the rate limit.",
+            retryable: true
+          });
+        }
+      }
+      /**
+       * Returns remaining requests allowed in current window.
+       *
+       * @param {string} [key='default']
+       * @returns {number}
+       */
+      remaining(key = "default") {
+        const k = this._resolveKey(key);
+        const entry = this.store.get(k, this.windowMs);
+        if (!entry) return this.maxRequests;
+        return Math.max(0, this.maxRequests - entry.count);
+      }
+      /**
+       * Asynchronously returns remaining requests allowed in current window.
+       * @param {string} [key='default']
+       * @returns {Promise<number>}
+       */
+      async remainingAsync(key = "default") {
+        const k = this._resolveKey(key);
+        const entry = await this.store.get(k, this.windowMs);
+        if (!entry) return this.maxRequests;
+        return Math.max(0, this.maxRequests - entry.count);
+      }
+      /**
+       * Returns remaining seconds until the rate limit window resets.
+       *
+       * @param {string} [key='default']
+       * @returns {number} Seconds until reset
+       */
+      resetIn(key = "default") {
+        const k = this._resolveKey(key);
+        const entry = this.store.get(k, this.windowMs);
+        if (!entry) return 0;
+        const now = Date.now();
+        return Math.max(1, Math.ceil((entry.windowStart + this.windowMs - now) / 1e3));
+      }
+      /**
+       * Asynchronously returns remaining seconds until the rate limit window resets.
+       * @param {string} [key='default']
+       * @returns {Promise<number>}
+       */
+      async resetInAsync(key = "default") {
+        const k = this._resolveKey(key);
+        const entry = await this.store.get(k, this.windowMs);
+        if (!entry) return 0;
+        const now = Date.now();
+        return Math.max(1, Math.ceil((entry.windowStart + this.windowMs - now) / 1e3));
+      }
+      /**
+       * Clears rate limit state for key or all keys.
+       * @param {string} [key]
+       */
+      clear(key) {
+        const k = key !== void 0 ? this._resolveKey(key) : void 0;
+        return this.store.clear(k);
+      }
+      /**
+       * Asynchronously clears rate limit state.
+       * @param {string} [key]
+       * @returns {Promise<void>}
+       */
+      async clearAsync(key) {
+        const k = key !== void 0 ? this._resolveKey(key) : void 0;
+        return await this.store.clear(k);
+      }
+    };
+    var ConcurrencyLimiter = class {
+      /**
+       * @param {object} [options]
+       * @param {number|null} [options.perRequest=4]
+       * @param {number|null} [options.perUser=4]
+       * @param {number|null} [options.global=16]
+       * @param {object} [options.concurrency]
+       */
+      constructor(options = {}) {
+        const conf = options.concurrency || options;
+        const parse = (val, def) => {
+          if (val === null || val === "unlimited" || val === Infinity) return null;
+          if (val !== void 0) {
+            const n = Number(val);
+            return Number.isFinite(n) && n >= 0 ? n : def;
+          }
+          return def;
+        };
+        this.perRequest = parse(conf.perRequest ?? options.perRequest, 4);
+        this.perUser = parse(conf.perUser ?? options.perUser, 4);
+        this.global = parse(conf.global ?? options.global, 16);
+        this.activeGlobal = 0;
+        this.activeUsers = /* @__PURE__ */ new Map();
+      }
+      /**
+       * Attempts to acquire execution capacity. Throws E_CONCURRENCY_LIMIT_EXCEEDED if limit is reached.
+       * @param {object} [params]
+       * @param {string} [params.userId='anonymous']
+       * @param {number} [params.count=1]
+       * @returns {{ release: () => void }} Token to release capacity
+       */
+      acquire({ userId = "anonymous", count = 1 } = {}) {
+        if (this.global !== null && this.activeGlobal + count > this.global) {
+          throw new ZapwebpError3({
+            code: "E_CONCURRENCY_LIMIT_EXCEEDED",
+            message: `Global concurrency limit of ${this.global} reached. Currently active conversions: ${this.activeGlobal}.`,
+            fix: "Wait for active conversions to finish or raise concurrency.global in settings.",
+            retryable: true
+          });
+        }
+        if (this.perUser !== null) {
+          const userActive = this.activeUsers.get(userId) || 0;
+          if (userActive + count > this.perUser) {
+            throw new ZapwebpError3({
+              code: "E_CONCURRENCY_LIMIT_EXCEEDED",
+              message: `User concurrency limit of ${this.perUser} reached for user "${userId}". Currently active conversions: ${userActive}.`,
+              fix: "Wait for your running conversions to complete or raise concurrency.perUser.",
+              retryable: true
+            });
+          }
+        }
+        this.activeGlobal += count;
+        this.activeUsers.set(userId, (this.activeUsers.get(userId) || 0) + count);
+        let released = false;
+        return {
+          release: () => {
+            if (!released) {
+              released = true;
+              this.release({ userId, count });
+            }
+          }
+        };
+      }
+      /**
+       * Releases active execution capacity.
+       * @param {object} [params]
+       * @param {string} [params.userId='anonymous']
+       * @param {number} [params.count=1]
+       */
+      release({ userId = "anonymous", count = 1 } = {}) {
+        this.activeGlobal = Math.max(0, this.activeGlobal - count);
+        const userActive = this.activeUsers.get(userId) || 0;
+        const nextUser = Math.max(0, userActive - count);
+        if (nextUser <= 0) {
+          this.activeUsers.delete(userId);
+        } else {
+          this.activeUsers.set(userId, nextUser);
+        }
+      }
+      /**
+       * Executes task with automatic acquire and release in finally.
+       * @param {() => Promise<any>} taskFn
+       * @param {object} [params]
+       * @param {string} [params.userId='anonymous']
+       * @param {number} [params.count=1]
+       * @returns {Promise<any>}
+       */
+      async run(taskFn, { userId = "anonymous", count = 1 } = {}) {
+        const token = this.acquire({ userId, count });
+        try {
+          return await taskFn();
+        } finally {
+          token.release();
+        }
+      }
+      /**
+       * Retrieves active concurrency status.
+       * @param {object} [params]
+       * @param {string} [params.userId='anonymous']
+       * @returns {object}
+       */
+      getStatus({ userId = "anonymous" } = {}) {
+        return {
+          activeGlobal: this.activeGlobal,
+          maxGlobal: this.global,
+          activeUser: this.activeUsers.get(userId) || 0,
+          maxUser: this.perUser,
+          perRequest: this.perRequest
+        };
+      }
+    };
+    module2.exports = {
+      DEFAULT_LIMITS: DEFAULT_LIMITS3,
+      resolveLimits: resolveLimits2,
+      formatBytes: formatBytes2,
+      evaluateLimits: evaluateLimits2,
+      createLimitsMetadata: createLimitsMetadata2,
+      RateLimitStore,
+      MemoryRateLimitStore,
+      FileRateLimitStore,
+      RateLimiter,
+      ConcurrencyLimiter
+    };
+  }
+});
+
+// packages/shared/src/session.js
+var require_session = __commonJS({
+  "packages/shared/src/session.js"(exports2, module2) {
+    "use strict";
+    var fs2 = require("node:fs");
+    var path8 = require("node:path");
+    var crypto3 = require("node:crypto");
+    var { ZapwebpError: ZapwebpError3 } = require_errors();
+    function generateSessionId() {
+      return `zap-sess-${crypto3.randomUUID()}`;
+    }
+    var SessionState = class {
+      constructor({
+        sessionId = null,
+        surface = "generic",
+        createdAt = null,
+        updatedAt = null,
+        expiresAt = null,
+        filesProcessed = 0,
+        bytesProcessed = 0,
+        requestsCount = 0
+      } = {}) {
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        this.sessionId = sessionId || generateSessionId();
+        this.surface = surface;
+        this.createdAt = createdAt || now;
+        this.updatedAt = updatedAt || now;
+        this.expiresAt = expiresAt || null;
+        this.filesProcessed = Number.isFinite(filesProcessed) && filesProcessed >= 0 ? filesProcessed : 0;
+        this.bytesProcessed = Number.isFinite(bytesProcessed) && bytesProcessed >= 0 ? bytesProcessed : 0;
+        this.requestsCount = Number.isFinite(requestsCount) && requestsCount >= 0 ? requestsCount : 0;
+      }
+      toJSON() {
+        return {
+          sessionId: this.sessionId,
+          surface: this.surface,
+          createdAt: this.createdAt,
+          updatedAt: this.updatedAt,
+          expiresAt: this.expiresAt,
+          filesProcessed: this.filesProcessed,
+          bytesProcessed: this.bytesProcessed,
+          requestsCount: this.requestsCount
+        };
+      }
+    };
+    var MemorySessionStore = class {
+      constructor(initialState = null) {
+        this.session = initialState ? new SessionState(initialState) : null;
+      }
+      load() {
+        return this.session;
+      }
+      save(session) {
+        this.session = session;
+      }
+      clear() {
+        this.session = null;
+      }
+    };
+    var FileSessionStore2 = class {
+      constructor({ filePath = path8.join(".zapwebp", "session.json") } = {}) {
+        this.filePath = path8.resolve(filePath);
+      }
+      load() {
+        try {
+          if (!fs2.existsSync(this.filePath)) return null;
+          const raw = fs2.readFileSync(this.filePath, "utf8");
+          const data = JSON.parse(raw);
+          return new SessionState(data);
+        } catch {
+          return null;
+        }
+      }
+      save(session) {
+        try {
+          const dir = path8.dirname(this.filePath);
+          if (!fs2.existsSync(dir)) fs2.mkdirSync(dir, { recursive: true });
+          const tmp = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
+          fs2.writeFileSync(tmp, JSON.stringify(session.toJSON(), null, 2) + "\n", "utf8");
+          fs2.renameSync(tmp, this.filePath);
+        } catch {
+        }
+      }
+      clear() {
+        try {
+          if (fs2.existsSync(this.filePath)) fs2.unlinkSync(this.filePath);
+        } catch {
+        }
+      }
+    };
+    var WebSessionStore = class {
+      constructor({ storageKey = "zapwebp_session_v1" } = {}) {
+        this.storageKey = storageKey;
+        this.fallback = new MemorySessionStore();
+      }
+      load() {
+        try {
+          if (typeof sessionStorage !== "undefined") {
+            const raw = sessionStorage.getItem(this.storageKey);
+            if (raw) return new SessionState(JSON.parse(raw));
+          }
+        } catch {
+        }
+        return this.fallback.load();
+      }
+      save(session) {
+        try {
+          if (typeof sessionStorage !== "undefined") {
+            sessionStorage.setItem(this.storageKey, JSON.stringify(session.toJSON()));
+            return;
+          }
+        } catch {
+        }
+        this.fallback.save(session);
+      }
+      clear() {
+        try {
+          if (typeof sessionStorage !== "undefined") {
+            sessionStorage.removeItem(this.storageKey);
+            return;
+          }
+        } catch {
+        }
+        this.fallback.clear();
+      }
+    };
+    var SessionManager2 = class {
+      /**
+       * @param {object} [options]
+       * @param {string} [options.surface='generic'] - 'web' | 'cli' | 'mcp' | 'sdk' | 'storage'
+       * @param {object} [options.store] - Store instance (MemorySessionStore, FileSessionStore, WebSessionStore)
+       * @param {number|null} [options.ttlMs=86400000] - 24 hour rolling TTL default
+       */
+      constructor({
+        surface = "generic",
+        store = null,
+        ttlMs = 864e5
+        // 24 hours
+      } = {}) {
+        this.surface = surface;
+        this.ttlMs = ttlMs;
+        this.store = store || new MemorySessionStore();
+      }
+      /**
+       * Loads current session or creates a new one if expired or absent.
+       * @returns {SessionState}
+       */
+      getSession() {
+        let session = this.store.load();
+        const now = Date.now();
+        if (session) {
+          if (session.expiresAt && now > new Date(session.expiresAt).getTime()) {
+            session = null;
+          }
+        }
+        if (!session) {
+          const expiresAt = this.ttlMs ? new Date(now + this.ttlMs).toISOString() : null;
+          session = new SessionState({
+            surface: this.surface,
+            expiresAt
+          });
+          this.store.save(session);
+        }
+        return session;
+      }
+      /**
+       * Checks if adding count files would exceed maxFilesPerSession.
+       * @param {number} count
+       * @param {number|null} maxFilesPerSession
+       * @returns {boolean}
+       */
+      canProcess(count = 1, maxFilesPerSession = null) {
+        if (maxFilesPerSession === null) return true;
+        const session = this.getSession();
+        return session.filesProcessed + count <= maxFilesPerSession;
+      }
+      /**
+       * Records newly processed files and bytes. Throws E_SESSION_LIMIT_EXCEEDED if limit would be breached.
+       * @param {object} params
+       * @param {number} [params.filesCount=1]
+       * @param {number} [params.bytesCount=0]
+       * @param {number|null} [params.maxFilesPerSession=null]
+       * @returns {SessionState}
+       */
+      record({ filesCount = 1, bytesCount = 0, maxFilesPerSession = null } = {}) {
+        const session = this.getSession();
+        if (maxFilesPerSession !== null && session.filesProcessed + filesCount > maxFilesPerSession) {
+          throw new ZapwebpError3({
+            code: "E_SESSION_LIMIT_EXCEEDED",
+            message: `Session limit of ${maxFilesPerSession} files reached. Processed ${session.filesProcessed + filesCount} files in this session.`,
+            fix: this.surface === "cli" ? "Start a new session with 'zap --reset-session', or raise the limit in .zapwebp/config.json." : "Close and re-open the session, or raise the limit in settings.",
+            retryable: false
+          });
+        }
+        session.filesProcessed += filesCount;
+        session.bytesProcessed += bytesCount;
+        session.requestsCount += 1;
+        session.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+        if (this.ttlMs) {
+          session.expiresAt = new Date(Date.now() + this.ttlMs).toISOString();
+        }
+        this.store.save(session);
+        return session;
+      }
+      /**
+       * Resets the active session to 0 with a new sessionId.
+       * @returns {SessionState}
+       */
+      reset() {
+        const now = Date.now();
+        const expiresAt = this.ttlMs ? new Date(now + this.ttlMs).toISOString() : null;
+        const session = new SessionState({
+          surface: this.surface,
+          expiresAt
+        });
+        this.store.save(session);
+        return session;
+      }
+    };
+    module2.exports = {
+      generateSessionId,
+      SessionState,
+      SessionManager: SessionManager2,
+      MemorySessionStore,
+      FileSessionStore: FileSessionStore2,
+      WebSessionStore
     };
   }
 });
@@ -2271,6 +3210,26 @@ var require_src = __commonJS({
       const cleaned = routePath.startsWith("/") ? routePath : `/${routePath}`;
       return `${APP_ORIGIN}${cleaned}`;
     }
+    var {
+      DEFAULT_LIMITS: DEFAULT_LIMITS3,
+      resolveLimits: resolveLimits2,
+      formatBytes: formatBytes2,
+      evaluateLimits: evaluateLimits2,
+      createLimitsMetadata: createLimitsMetadata2,
+      RateLimiter,
+      RateLimitStore,
+      MemoryRateLimitStore,
+      FileRateLimitStore,
+      ConcurrencyLimiter
+    } = require_limits();
+    var {
+      generateSessionId,
+      SessionState,
+      SessionManager: SessionManager2,
+      MemorySessionStore,
+      FileSessionStore: FileSessionStore2,
+      WebSessionStore
+    } = require_session();
     module2.exports = {
       APP_ORIGIN,
       DEFAULT_PORT,
@@ -2283,6 +3242,22 @@ var require_src = __commonJS({
       ZAPWEBP_USER_AGENT,
       DEFAULT_OPTIONS: DEFAULT_OPTIONS3,
       DEFAULT_CONVERSION_POLICY,
+      DEFAULT_LIMITS: DEFAULT_LIMITS3,
+      resolveLimits: resolveLimits2,
+      formatBytes: formatBytes2,
+      evaluateLimits: evaluateLimits2,
+      createLimitsMetadata: createLimitsMetadata2,
+      RateLimiter,
+      RateLimitStore,
+      MemoryRateLimitStore,
+      FileRateLimitStore,
+      ConcurrencyLimiter,
+      generateSessionId,
+      SessionState,
+      SessionManager: SessionManager2,
+      MemorySessionStore,
+      FileSessionStore: FileSessionStore2,
+      WebSessionStore,
       ERROR_CATALOG,
       ZapwebpError: ZapwebpError3,
       i18n,
@@ -2843,7 +3818,12 @@ var require_chunk_stripper = __commonJS({
         } else if (marker === 237) {
           drop = true;
         } else if (marker === 254) {
-          drop = true;
+          const payload = buf.subarray(offset + 2, segEnd).toString("utf8");
+          if (payload.startsWith("zapwebp:lock:") || payload.startsWith("zapwebp:custom:")) {
+            drop = false;
+          } else {
+            drop = true;
+          }
         }
         if (!drop) {
           chunks.push(buf.subarray(offset - 2, segEnd));
@@ -2899,7 +3879,14 @@ var require_chunk_stripper = __commonJS({
         const type = buf.toString("ascii", offset + 4, offset + 8);
         const chunkEnd = offset + 12 + length;
         if (chunkEnd > buf.length) break;
-        if (type === "eXIf" || type === "tEXt" || type === "iTXt" || type === "zTXt" || type === "tIME" || type === "pHYs" || type === "iCCP" && !keepIcc) {
+        if (type === "eXIf" || type === "zTXt" || type === "tIME" || type === "pHYs" || type === "iCCP" && !keepIcc) {
+        } else if (type === "tEXt" || type === "iTXt") {
+          const chunkData = buf.subarray(offset + 8, chunkEnd);
+          const nullIdx = chunkData.indexOf(0);
+          const keyword = nullIdx !== -1 ? chunkData.subarray(0, nullIdx).toString("latin1") : "";
+          if (keyword === "zapwebp:lock" || keyword === "zapwebp:custom") {
+            kept.push(buf.subarray(offset, chunkEnd));
+          }
         } else {
           kept.push(buf.subarray(offset, chunkEnd));
         }
@@ -2911,7 +3898,7 @@ var require_chunk_stripper = __commonJS({
       if (!Buffer.isBuffer(buf)) return buf;
       const str = buf.toString("utf8");
       if (!str.includes("<svg")) return buf;
-      const cleaned = str.replace(/<metadata[\s\S]*?<\/metadata>/gi, "").replace(/<rdf:RDF[\s\S]*?<\/rdf:RDF>/gi, "");
+      const cleaned = str.replace(/<metadata(?!\s+id="zapwebp-(?:lock|custom)")[\s\S]*?<\/metadata>/gi, "").replace(/<rdf:RDF[\s\S]*?<\/rdf:RDF>/gi, "");
       return Buffer.from(cleaned, "utf8");
     }
     function stripContainerMetadata(bytes, options = {}) {
@@ -3537,7 +4524,7 @@ var require_policy = __commonJS({
 var require_tools = __commonJS({
   "packages/core/src/tools.js"(exports2, module2) {
     "use strict";
-    var path7 = require("node:path");
+    var path8 = require("node:path");
     var fs2 = require("node:fs");
     function listTools() {
       return [
@@ -3744,7 +4731,7 @@ var require_tools = __commonJS({
       ];
     }
     function getAgentManifest() {
-      const manifestPath = path7.resolve(__dirname, "..", "agent.json");
+      const manifestPath = path8.resolve(__dirname, "..", "agent.json");
       try {
         const raw = fs2.readFileSync(manifestPath, "utf8");
         return JSON.parse(raw);
@@ -4574,7 +5561,7 @@ var require_signals = __commonJS({
 var require_report = __commonJS({
   "packages/core/src/report.js"(exports2, module2) {
     "use strict";
-    function formatBytes(bytes, decimals = 1) {
+    function formatBytes2(bytes, decimals = 1) {
       if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
       const units = ["B", "KB", "MB", "GB", "TB"];
       const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
@@ -4732,13 +5719,13 @@ var require_report = __commonJS({
         savedBytes: data.savedBytes,
         originalBytes: data.originalBytes,
         optimizedBytes: data.optimizedBytes,
-        savedFormatted: formatBytes(data.savedBytes)
+        savedFormatted: formatBytes2(data.savedBytes)
       })).sort((a, b) => b.savedBytes - a.savedBytes);
       const bySource = Object.entries(sourceBuckets).map(([source, data]) => ({
         source,
         count: data.count,
         savedBytes: data.savedBytes,
-        savedFormatted: formatBytes(data.savedBytes)
+        savedFormatted: formatBytes2(data.savedBytes)
       })).sort((a, b) => b.count - a.count);
       const gbSaved = savedBytes / (1024 * 1024 * 1024);
       const kwh = Number((gbSaved * 0.06).toFixed(3));
@@ -4750,11 +5737,11 @@ var require_report = __commonJS({
         periodEnd: latestTime ? new Date(latestTime).toISOString() : null,
         totalFiles,
         originalBytes,
-        originalFormatted: formatBytes(originalBytes),
+        originalFormatted: formatBytes2(originalBytes),
         optimizedBytes,
-        optimizedFormatted: formatBytes(optimizedBytes),
+        optimizedFormatted: formatBytes2(optimizedBytes),
         savedBytes,
-        savedFormatted: formatBytes(savedBytes),
+        savedFormatted: formatBytes2(savedBytes),
         savedPercentage,
         avgLatencyMs,
         topSavings,
@@ -4800,7 +5787,7 @@ var require_report = __commonJS({
           "|---|---|---|---|---|"
         ];
         (report.topSavings || []).slice(0, 10).forEach((item, idx) => {
-          lines.push(`| ${idx + 1} | \`${item.fileName}\` | ${formatBytes(item.originalBytes)} | ${formatBytes(item.optimizedBytes)} | \u2212${item.savedPercent}% |`);
+          lines.push(`| ${idx + 1} | \`${item.fileName}\` | ${formatBytes2(item.originalBytes)} | ${formatBytes2(item.optimizedBytes)} | \u2212${item.savedPercent}% |`);
         });
         if (report.byFormat && report.byFormat.length) {
           lines.push("", "#### Savings by Format", "", "| Format | Files | Saved |", "|---|---|---|");
@@ -4826,8 +5813,8 @@ var require_report = __commonJS({
         report.topSavings.forEach((item, idx) => {
           const num = String(idx + 1).padStart(2, " ");
           const name = item.fileName.length > 18 ? item.fileName.slice(0, 15) + "..." : item.fileName.padEnd(18, " ");
-          const orig = formatBytes(item.originalBytes);
-          const opt = formatBytes(item.optimizedBytes);
+          const orig = formatBytes2(item.originalBytes);
+          const opt = formatBytes2(item.optimizedBytes);
           out.push(`  ${num}. ${name} ${orig} \u2192 ${opt}  (\u2212${item.savedPercent}%)`);
         });
         out.push("");
@@ -4854,7 +5841,7 @@ var require_report = __commonJS({
       return out.join("\n");
     }
     module2.exports = {
-      formatBytes,
+      formatBytes: formatBytes2,
       parseSince,
       computePerformanceReport: computePerformanceReport2,
       formatPerformanceReport: formatPerformanceReport2
@@ -5110,7 +6097,7 @@ var require_smart = __commonJS({
 var require_team_policy = __commonJS({
   "packages/core/src/team-policy.js"(exports2, module2) {
     "use strict";
-    var path7 = require("node:path");
+    var path8 = require("node:path");
     var DEFAULT_TEAM_POLICY_TEMPLATE2 = {
       version: "1.0.0",
       policy: {
@@ -5531,7 +6518,7 @@ var require_compression = __commonJS({
 var require_src2 = __commonJS({
   "packages/core/src/index.js"(exports2, module2) {
     "use strict";
-    var path7 = require("node:path");
+    var path8 = require("node:path");
     var crypto3 = require("node:crypto");
     var formats = require_formats();
     var metadata = require_metadata();
@@ -7057,12 +8044,12 @@ var require_src2 = __commonJS({
     }
     function outputName2(inputPath, format = "webp", scale = 1) {
       const extension = format === "jpeg" ? "jpg" : format;
-      const base = path7.basename(inputPath, path7.extname(inputPath)) || "image";
+      const base = path8.basename(inputPath, path8.extname(inputPath)) || "image";
       const suffix = scaleSuffix2(scale);
       return `${base}${suffix}.${extension}`;
     }
     function generateSrcset2(baseFile, scales = [1], format = "webp", alt = "") {
-      const base = path7.basename(baseFile, path7.extname(baseFile)) || "image";
+      const base = path8.basename(baseFile, path8.extname(baseFile)) || "image";
       const ext = format === "jpeg" ? "jpg" : format;
       const sorted = parseScales2(scales);
       const primaryFile = `${base}.${ext}`;
@@ -7167,9 +8154,39 @@ var require_src2 = __commonJS({
   }
 });
 
+// packages/cli/src/session.js
+function getSessionFilePath(rootDir) {
+  return import_node_path.default.join(rootDir, ".zapwebp", "session.json");
+}
+function getSessionManager(rootDir) {
+  const filePath = getSessionFilePath(rootDir);
+  const store = new FileSessionStore({ filePath });
+  return new SessionManager({ surface: "cli", store });
+}
+async function loadSession(rootDir) {
+  const manager = getSessionManager(rootDir);
+  return manager.getSession().toJSON();
+}
+async function recordSession(rootDir, count, bytes = 0) {
+  const manager = getSessionManager(rootDir);
+  return manager.record({ filesCount: count, bytesCount: bytes }).toJSON();
+}
+async function resetSession(rootDir) {
+  const manager = getSessionManager(rootDir);
+  return manager.reset().toJSON();
+}
+var import_node_path, import_shared, SessionManager, FileSessionStore;
+var init_session = __esm({
+  "packages/cli/src/session.js"() {
+    import_node_path = __toESM(require("node:path"), 1);
+    import_shared = __toESM(require_src(), 1);
+    ({ SessionManager, FileSessionStore } = import_shared.default);
+  }
+});
+
 // packages/cli/src/fs.js
 async function writeSafe(destPath, data, attempts = 3) {
-  const dir = import_node_path.default.dirname(destPath);
+  const dir = import_node_path2.default.dirname(destPath);
   try {
     await import_promises.default.mkdir(dir, { recursive: true });
   } catch (err2) {
@@ -7182,7 +8199,7 @@ async function writeSafe(destPath, data, attempts = 3) {
     }
     throw err2;
   }
-  const tmpPath = import_node_path.default.join(dir, `.zap-tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const tmpPath = import_node_path2.default.join(dir, `.zap-tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   try {
     await import_promises.default.writeFile(tmpPath, data);
   } catch (err2) {
@@ -7225,13 +8242,13 @@ async function writeSafe(destPath, data, attempts = 3) {
     }
   }
 }
-var import_promises, import_node_path, import_shared, ZapwebpError;
+var import_promises, import_node_path2, import_shared2, ZapwebpError;
 var init_fs = __esm({
   "packages/cli/src/fs.js"() {
     import_promises = __toESM(require("node:fs/promises"), 1);
-    import_node_path = __toESM(require("node:path"), 1);
-    import_shared = __toESM(require_src(), 1);
-    ({ ZapwebpError } = import_shared.default);
+    import_node_path2 = __toESM(require("node:path"), 1);
+    import_shared2 = __toESM(require_src(), 1);
+    ({ ZapwebpError } = import_shared2.default);
   }
 });
 
@@ -7742,26 +8759,26 @@ var require_ignore = __commonJS({
       const index = body.indexOf(SLASH);
       return index < 0 || index === body.length - 1;
     };
-    var basenameOf = (path7) => {
-      const end = path7.length - 1;
-      const index = path7.lastIndexOf(
+    var basenameOf = (path8) => {
+      const end = path8.length - 1;
+      const index = path8.lastIndexOf(
         SLASH,
-        path7[end] === SLASH ? end - 1 : end
+        path8[end] === SLASH ? end - 1 : end
       );
-      return index < 0 ? path7 : path7.slice(index + 1);
+      return index < 0 ? path8 : path8.slice(index + 1);
     };
-    var parentOf = (path7) => {
-      if (path7.charCodeAt(0) === SLASH_CODE || path7.indexOf(DOUBLE_SLASH) >= 0) {
-        const slices = path7.split(SLASH).filter(Boolean);
+    var parentOf = (path8) => {
+      if (path8.charCodeAt(0) === SLASH_CODE || path8.indexOf(DOUBLE_SLASH) >= 0) {
+        const slices = path8.split(SLASH).filter(Boolean);
         slices.pop();
         return slices.length ? slices.join(SLASH) + SLASH : EMPTY;
       }
-      const end = path7.length - 1;
-      const cut = path7.lastIndexOf(
+      const end = path8.length - 1;
+      const cut = path8.lastIndexOf(
         SLASH,
-        path7.charCodeAt(end) === SLASH_CODE ? end - 1 : end
+        path8.charCodeAt(end) === SLASH_CODE ? end - 1 : end
       );
-      return cut < 0 ? EMPTY : path7.slice(0, cut + 1);
+      return cut < 0 ? EMPTY : path8.slice(0, cut + 1);
     };
     var isString = (subject) => typeof subject === "string";
     var checkPattern = (pattern) => pattern && isString(pattern) && !REGEX_INVALID_TRAILING_BACKSLASH.test(pattern);
@@ -7896,7 +8913,7 @@ var require_ignore = __commonJS({
       // Match the literal 'abc/' for `checkIgnore`, last rule wins. Only a rule
       //   ending in a wildcard can match it (see `checkSourceOf`), so the rest
       //   are left out once, rather than tested or compiled for every path.
-      testLiteral(path7) {
+      testLiteral(path8) {
         const rules = this._literalRules || (this._literalRules = this._rules.filter(
           ({ body }) => body[body.length - (body[body.length - 1] === SLASH ? 2 : 1)] === "*"
         ));
@@ -7905,7 +8922,7 @@ var require_ignore = __commonJS({
         let matchedRule;
         for (let index = rules.length - 1; index >= 0; index--) {
           const rule = rules[index];
-          if (rule.checkRegex.test(path7)) {
+          if (rule.checkRegex.test(path8)) {
             ignored = !rule.negative;
             unignored = rule.negative;
             matchedRule = rule.negative ? UNDEFINED : rule;
@@ -7925,15 +8942,15 @@ var require_ignore = __commonJS({
       //
       // - mode `string` either `MODE_IGNORE` or `MODE_CHECK_IGNORE`
       // @returns {TestResult}
-      test(path7, mode) {
+      test(path8, mode) {
         const rules = this._rules;
         const { length } = rules;
         const shortcut = this._basenameCount * 2 >= length;
-        const basename = shortcut ? basenameOf(path7) : path7;
+        const basename = shortcut ? basenameOf(path8) : path8;
         for (let index = length - 1; index >= 0; index--) {
           const rule = rules[index];
           if (rule[mode].test(
-            shortcut && rule._basenameOnly ? basename : path7
+            shortcut && rule._basenameOnly ? basename : path8
           )) {
             const { negative } = rule;
             const ret = {
@@ -7955,17 +8972,17 @@ var require_ignore = __commonJS({
     var throwError = (message, Ctor) => {
       throw new Ctor(message);
     };
-    var checkPath = (path7, originalPath, doThrow) => {
-      if (!isString(path7)) {
+    var checkPath = (path8, originalPath, doThrow) => {
+      if (!isString(path8)) {
         return doThrow(
           `path must be a string, but got \`${originalPath}\``,
           TypeError
         );
       }
-      if (!path7) {
+      if (!path8) {
         return doThrow(`path must not be empty`, TypeError);
       }
-      if (checkPath.isNotRelative(path7)) {
+      if (checkPath.isNotRelative(path8)) {
         const r = "`path.relative()`d";
         return doThrow(
           `path should be a ${r} string, but got "${originalPath}"`,
@@ -7974,25 +8991,25 @@ var require_ignore = __commonJS({
       }
       return true;
     };
-    var isNotRelative = (path7) => {
-      const first = path7.charCodeAt(0);
+    var isNotRelative = (path8) => {
+      const first = path8.charCodeAt(0);
       if (first === SLASH_CODE) {
         return true;
       }
       if (first !== DOT_CODE) {
         return false;
       }
-      if (path7.length === 1) {
+      if (path8.length === 1) {
         return true;
       }
-      const second = path7.charCodeAt(1);
+      const second = path8.charCodeAt(1);
       if (second === SLASH_CODE) {
         return true;
       }
       if (second !== DOT_CODE) {
         return false;
       }
-      return path7.length === 2 || path7.charCodeAt(2) === SLASH_CODE;
+      return path8.length === 2 || path8.charCodeAt(2) === SLASH_CODE;
     };
     checkPath.isNotRelative = isNotRelative;
     checkPath.convert = (p) => p;
@@ -8023,54 +9040,54 @@ var require_ignore = __commonJS({
       }
       // @returns {TestResult}
       _test(originalPath, cache) {
-        const path7 = originalPath && checkPath.convert(originalPath);
+        const path8 = originalPath && checkPath.convert(originalPath);
         checkPath(
-          path7,
+          path8,
           originalPath,
           this._strictPathCheck ? throwError : RETURN_FALSE
         );
-        return this._t(path7, cache);
+        return this._t(path8, cache);
       }
-      checkIgnore(path7) {
-        if (path7.charCodeAt(path7.length - 1) !== SLASH_CODE) {
-          return this.test(path7);
+      checkIgnore(path8) {
+        if (path8.charCodeAt(path8.length - 1) !== SLASH_CODE) {
+          return this.test(path8);
         }
-        const dir = this._t(path7, this._testCache);
+        const dir = this._t(path8, this._testCache);
         if (dir.ignored) {
           return dir;
         }
-        const literal = this._rules.testLiteral(path7);
+        const literal = this._rules.testLiteral(path8);
         return literal.ignored || literal.unignored ? literal : dir;
       }
-      _t(path7, cache) {
-        if (path7 in cache) {
-          return cache[path7];
+      _t(path8, cache) {
+        if (path8 in cache) {
+          return cache[path8];
         }
-        const parentPath = parentOf(path7);
+        const parentPath = parentOf(path8);
         const parent = parentPath ? this._t(parentPath, cache) : UNDEFINED;
-        return cache[path7] = parent && parent.ignored ? parent : this._rules.test(path7, MODE_IGNORE);
+        return cache[path8] = parent && parent.ignored ? parent : this._rules.test(path8, MODE_IGNORE);
       }
-      ignores(path7) {
-        return this._test(path7, this._ignoreCache).ignored;
+      ignores(path8) {
+        return this._test(path8, this._ignoreCache).ignored;
       }
       createFilter() {
-        return (path7) => !this.ignores(path7);
+        return (path8) => !this.ignores(path8);
       }
       filter(paths) {
         return makeArray(paths).filter(this.createFilter());
       }
       // @returns {TestResult}
-      test(path7) {
-        return this._test(path7, this._testCache);
+      test(path8) {
+        return this._test(path8, this._testCache);
       }
     };
     var factory = (options) => new Ignore(options);
-    var isPathValid = (path7) => checkPath(path7 && checkPath.convert(path7), path7, RETURN_FALSE);
+    var isPathValid = (path8) => checkPath(path8 && checkPath.convert(path8), path8, RETURN_FALSE);
     var setupWindows = () => {
       const makePosix = (str) => /^\\\\\?\\/.test(str) || /["<>|\u0000-\u001F]+/u.test(str) ? str : str.replace(/\\/g, "/");
       checkPath.convert = makePosix;
       const REGEX_TEST_WINDOWS_PATH_ABSOLUTE = /^[a-z]:\//i;
-      checkPath.isNotRelative = (path7) => REGEX_TEST_WINDOWS_PATH_ABSOLUTE.test(path7) || isNotRelative(path7);
+      checkPath.isNotRelative = (path8) => REGEX_TEST_WINDOWS_PATH_ABSOLUTE.test(path8) || isNotRelative(path8);
     };
     if (
       // Detect `process` so that it can run in browsers.
@@ -8093,7 +9110,7 @@ function getGitFiles(mode, cwd = process.cwd()) {
   try {
     const gitCmd = mode === "staged" ? "git diff --cached --name-only --diff-filter=ACMR" : "git diff --name-only --diff-filter=ACMR HEAD";
     const output = (0, import_node_child_process.execSync)(gitCmd, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    return output.split("\n").map((line) => line.trim()).filter(Boolean).map((rel) => import_node_path2.default.resolve(cwd, rel));
+    return output.split("\n").map((line) => line.trim()).filter(Boolean).map((rel) => import_node_path3.default.resolve(cwd, rel));
   } catch {
     return [];
   }
@@ -8106,7 +9123,7 @@ async function createIgnoreChecker(rootDir, options = {}) {
     for (const r of DEFAULT_IGNORES) ruleOrigins.push({ rule: r, source: "builtin" });
   }
   if (!options.includeIgnored && !options.includeAll) {
-    const zapignorePath = import_node_path2.default.join(rootDir, ".zapwebpignore");
+    const zapignorePath = import_node_path3.default.join(rootDir, ".zapwebpignore");
     const zapignoreContent = await (0, import_promises2.readFile)(zapignorePath, "utf8").catch(() => null);
     if (zapignoreContent) {
       const lines = zapignoreContent.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
@@ -8120,7 +9137,7 @@ async function createIgnoreChecker(rootDir, options = {}) {
   }
   return {
     isIgnored(filePath) {
-      const rel = import_node_path2.default.relative(rootDir, filePath).replace(/\\/g, "/");
+      const rel = import_node_path3.default.relative(rootDir, filePath).replace(/\\/g, "/");
       if (rel.startsWith(".zapwebp/") || rel === ".zapwebp") {
         return { ignored: true, rule: ".zapwebp/**", source: "internal_artifact" };
       }
@@ -8145,9 +9162,9 @@ async function evaluateGateChain(filePath, context) {
     allowUnsafe = false,
     force = false
   } = context;
-  const resolved = import_node_path2.default.resolve(filePath);
-  const relRoot = import_node_path2.default.relative(rootDir, resolved);
-  const isOutside = relRoot === ".." || relRoot.startsWith(`..${import_node_path2.default.sep}`) || import_node_path2.default.isAbsolute(relRoot);
+  const resolved = import_node_path3.default.resolve(filePath);
+  const relRoot = import_node_path3.default.relative(rootDir, resolved);
+  const isOutside = relRoot === ".." || relRoot.startsWith(`..${import_node_path3.default.sep}`) || import_node_path3.default.isAbsolute(relRoot);
   if (isOutside && !allowOutside && !force) {
     return { inScope: false, reason: "outside_root", detail: "Path escapes project boundary" };
   }
@@ -8180,7 +9197,7 @@ async function evaluateGateChain(filePath, context) {
   try {
     format = detectFormat(bytes);
   } catch (err2) {
-    const ext = import_node_path2.default.extname(resolved).toLowerCase();
+    const ext = import_node_path3.default.extname(resolved).toLowerCase();
     if (ext === ".heic" || ext === ".heif") {
       return { inScope: false, reason: "unsupported_format", detail: "This format requires a plugin. Install it with: npm i -g zapwebp-format-heic" };
     }
@@ -8210,12 +9227,12 @@ async function evaluateGateChain(filePath, context) {
     bytes
   };
 }
-var import_promises2, import_node_child_process, import_node_path2, import_node_crypto, import_ignore, import_core, detectFormat, checkSvgSafety, INPUT_FORMATS, DEFAULT_IGNORES, DEFAULT_MAX_FILE_SIZE;
+var import_promises2, import_node_child_process, import_node_path3, import_node_crypto, import_ignore, import_core, detectFormat, checkSvgSafety, INPUT_FORMATS, DEFAULT_IGNORES, DEFAULT_MAX_FILE_SIZE;
 var init_gate_chain = __esm({
   "packages/cli/src/gate-chain.js"() {
     import_promises2 = require("node:fs/promises");
     import_node_child_process = require("node:child_process");
-    import_node_path2 = __toESM(require("node:path"), 1);
+    import_node_path3 = __toESM(require("node:path"), 1);
     import_node_crypto = __toESM(require("node:crypto"), 1);
     import_ignore = __toESM(require_ignore(), 1);
     import_core = __toESM(require_src2(), 1);
@@ -8248,17 +9265,17 @@ function generateTransactionId() {
   return `${ts}-${rnd}`;
 }
 function getJournalPaths(rootDir) {
-  const zapDir = import_node_path3.default.resolve(rootDir, ".zapwebp");
+  const zapDir = import_node_path4.default.resolve(rootDir, ".zapwebp");
   return {
     zapDir,
-    journalDir: import_node_path3.default.join(zapDir, "journal"),
-    backupsDir: import_node_path3.default.join(zapDir, "backups")
+    journalDir: import_node_path4.default.join(zapDir, "journal"),
+    backupsDir: import_node_path4.default.join(zapDir, "backups")
   };
 }
 async function writeTransaction(rootDir, transaction) {
   const { journalDir } = getJournalPaths(rootDir);
   await (0, import_promises3.mkdir)(journalDir, { recursive: true });
-  const journalPath = import_node_path3.default.join(journalDir, `${transaction.id}.json`);
+  const journalPath = import_node_path4.default.join(journalDir, `${transaction.id}.json`);
   await (0, import_promises3.writeFile)(journalPath, JSON.stringify(transaction, null, 2) + "\n", "utf8");
   return journalPath;
 }
@@ -8269,7 +9286,7 @@ async function listTransactions(rootDir) {
   for (const file of files) {
     if (!file.endsWith(".json")) continue;
     try {
-      const content = await (0, import_promises3.readFile)(import_node_path3.default.join(journalDir, file), "utf8");
+      const content = await (0, import_promises3.readFile)(import_node_path4.default.join(journalDir, file), "utf8");
       const data = JSON.parse(content);
       transactions.push(data);
     } catch {
@@ -8289,7 +9306,7 @@ async function undoTransaction(rootDir, targetId, options = {}) {
   const { backupsDir, journalDir } = getJournalPaths(rootDir);
   const undoneOperations = [];
   for (const op of tx.operations) {
-    const fullPath = import_node_path3.default.resolve(rootDir, op.path);
+    const fullPath = import_node_path4.default.resolve(rootDir, op.path);
     if (op.type === "create") {
       const existing = await (0, import_promises3.readFile)(fullPath).catch(() => null);
       if (existing) {
@@ -8297,33 +9314,33 @@ async function undoTransaction(rootDir, targetId, options = {}) {
         if (currentHash !== op.sha256 && !options.forceUndo) {
           throw new Error(`Cannot undo create for ${op.path}: file was modified since conversion. Use --force-undo to delete anyway.`);
         }
-        const backupFile = import_node_path3.default.resolve(backupsDir, tx.id, op.path);
-        await (0, import_promises3.mkdir)(import_node_path3.default.dirname(backupFile), { recursive: true });
+        const backupFile = import_node_path4.default.resolve(backupsDir, tx.id, op.path);
+        await (0, import_promises3.mkdir)(import_node_path4.default.dirname(backupFile), { recursive: true });
         await (0, import_promises3.writeFile)(backupFile, existing);
         await (0, import_promises3.rm)(fullPath, { force: true });
         undoneOperations.push({ type: "delete_created", path: op.path });
       }
     } else if (op.type === "modify" || op.type === "delete") {
       let backupFile;
-      if (op.backupPath && import_node_path3.default.isAbsolute(op.backupPath)) {
+      if (op.backupPath && import_node_path4.default.isAbsolute(op.backupPath)) {
         backupFile = op.backupPath;
       } else if (op.backupPath && op.backupPath.includes(".zapwebp")) {
-        backupFile = import_node_path3.default.resolve(rootDir, op.backupPath);
+        backupFile = import_node_path4.default.resolve(rootDir, op.backupPath);
       } else {
-        backupFile = import_node_path3.default.resolve(backupsDir, tx.id, op.backupPath || op.path);
+        backupFile = import_node_path4.default.resolve(backupsDir, tx.id, op.backupPath || op.path);
       }
       const backupData = await (0, import_promises3.readFile)(backupFile).catch(() => null);
       if (!backupData) {
         throw new Error(`Backup data missing for ${op.path} in transaction ${tx.id}`);
       }
-      await (0, import_promises3.mkdir)(import_node_path3.default.dirname(fullPath), { recursive: true });
+      await (0, import_promises3.mkdir)(import_node_path4.default.dirname(fullPath), { recursive: true });
       await (0, import_promises3.writeFile)(fullPath, backupData);
       undoneOperations.push({ type: "restored_from_backup", path: op.path });
     }
   }
   tx.status = "undone";
   tx.undoneAt = (/* @__PURE__ */ new Date()).toISOString();
-  await (0, import_promises3.writeFile)(import_node_path3.default.join(journalDir, `${tx.id}.json`), JSON.stringify(tx, null, 2) + "\n", "utf8");
+  await (0, import_promises3.writeFile)(import_node_path4.default.join(journalDir, `${tx.id}.json`), JSON.stringify(tx, null, 2) + "\n", "utf8");
   return {
     id: tx.id,
     undoneCount: undoneOperations.length,
@@ -8339,12 +9356,12 @@ async function redoTransaction(rootDir, targetId) {
   const { journalDir, backupsDir } = getJournalPaths(rootDir);
   const redoneOps = [];
   for (const op of tx.operations) {
-    const fullPath = import_node_path3.default.resolve(rootDir, op.path);
+    const fullPath = import_node_path4.default.resolve(rootDir, op.path);
     if (op.type === "create" || op.type === "modify") {
-      const backupFile = import_node_path3.default.resolve(backupsDir, tx.id, op.path);
+      const backupFile = import_node_path4.default.resolve(backupsDir, tx.id, op.path);
       const backupData = await (0, import_promises3.readFile)(backupFile).catch(() => null);
       if (backupData) {
-        await (0, import_promises3.mkdir)(import_node_path3.default.dirname(fullPath), { recursive: true });
+        await (0, import_promises3.mkdir)(import_node_path4.default.dirname(fullPath), { recursive: true });
         await (0, import_promises3.writeFile)(fullPath, backupData);
         redoneOps.push({ type: "recreated", path: op.path });
       }
@@ -8355,7 +9372,7 @@ async function redoTransaction(rootDir, targetId) {
   }
   tx.status = "completed";
   delete tx.undoneAt;
-  await (0, import_promises3.writeFile)(import_node_path3.default.join(journalDir, `${tx.id}.json`), JSON.stringify(tx, null, 2) + "\n", "utf8");
+  await (0, import_promises3.writeFile)(import_node_path4.default.join(journalDir, `${tx.id}.json`), JSON.stringify(tx, null, 2) + "\n", "utf8");
   return {
     id: tx.id,
     redoneCount: redoneOps.length,
@@ -8374,8 +9391,8 @@ async function pruneJournal(rootDir, maxKeep = 50, maxAgeDays = 30, options = {}
     const age = now - new Date(tx.startedAt).getTime();
     const shouldPrune = Boolean(options.all) || i >= maxKeep || age > maxAgeMs;
     if (shouldPrune) {
-      const journalFile = import_node_path3.default.join(journalDir, `${tx.id}.json`);
-      const backupDir = import_node_path3.default.join(backupsDir, tx.id);
+      const journalFile = import_node_path4.default.join(journalDir, `${tx.id}.json`);
+      const backupDir = import_node_path4.default.join(backupsDir, tx.id);
       prunedFiles.push(journalFile, backupDir);
       prunedCount++;
       if (!options.dryRun) {
@@ -8388,29 +9405,29 @@ async function pruneJournal(rootDir, maxKeep = 50, maxAgeDays = 30, options = {}
   }
   return { prunedCount, prunedFiles };
 }
-var import_promises3, import_node_path3, import_node_crypto2;
+var import_promises3, import_node_path4, import_node_crypto2;
 var init_journal = __esm({
   "packages/cli/src/journal.js"() {
     import_promises3 = require("node:fs/promises");
-    import_node_path3 = __toESM(require("node:path"), 1);
+    import_node_path4 = __toESM(require("node:path"), 1);
     import_node_crypto2 = __toESM(require("node:crypto"), 1);
   }
 });
 
 // packages/cli/src/gitignore.js
 async function isGitRepo(rootDir) {
-  let curr = import_node_path4.default.resolve(rootDir);
+  let curr = import_node_path5.default.resolve(rootDir);
   while (true) {
-    const gitDir = import_node_path4.default.join(curr, ".git");
+    const gitDir = import_node_path5.default.join(curr, ".git");
     const info = await (0, import_promises4.stat)(gitDir).catch(() => null);
     if (info) return true;
-    const parent = import_node_path4.default.dirname(curr);
+    const parent = import_node_path5.default.dirname(curr);
     if (parent === curr) return false;
     curr = parent;
   }
 }
 async function readGitignore(rootDir) {
-  const filePath = import_node_path4.default.join(rootDir, ".gitignore");
+  const filePath = import_node_path5.default.join(rootDir, ".gitignore");
   try {
     const content = await (0, import_promises4.readFile)(filePath, "utf8");
     return { exists: true, content };
@@ -8426,10 +9443,10 @@ function extractBlockPaths(content) {
   return blockText.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
 }
 async function updateGitignoreBlock(rootDir, pathsToIgnore, options = {}) {
-  const gitignorePath = import_node_path4.default.join(rootDir, ".gitignore");
+  const gitignorePath = import_node_path5.default.join(rootDir, ".gitignore");
   const { exists, content } = await readGitignore(rootDir);
   const normalizedPaths = [...new Set(
-    pathsToIgnore.map((p) => p.trim().replace(/\\/g, "/")).map((p) => p.endsWith("/") || import_node_path4.default.extname(p) ? p : `${p}/`).filter(Boolean)
+    pathsToIgnore.map((p) => p.trim().replace(/\\/g, "/")).map((p) => p.endsWith("/") || import_node_path5.default.extname(p) ? p : `${p}/`).filter(Boolean)
   )];
   const blockLines = [
     BLOCK_START,
@@ -8470,7 +9487,7 @@ async function syncGitignore(rootDir, settings = {}) {
   const pathsToIgnore = new Set(existingBlockPaths);
   pathsToIgnore.add(".zapwebp/");
   if (outDir && !commitOutputs) {
-    const relOut = import_node_path4.default.relative(rootDir, import_node_path4.default.resolve(rootDir, outDir)).replace(/\\/g, "/");
+    const relOut = import_node_path5.default.relative(rootDir, import_node_path5.default.resolve(rootDir, outDir)).replace(/\\/g, "/");
     if (relOut && relOut !== ".") {
       pathsToIgnore.add(relOut.endsWith("/") ? relOut : `${relOut}/`);
     }
@@ -8478,11 +9495,11 @@ async function syncGitignore(rootDir, settings = {}) {
   const res = await updateGitignoreBlock(rootDir, Array.from(pathsToIgnore));
   return { applied: res.updated, paths: res.paths };
 }
-var import_promises4, import_node_path4, BLOCK_START, BLOCK_END;
+var import_promises4, import_node_path5, BLOCK_START, BLOCK_END;
 var init_gitignore = __esm({
   "packages/cli/src/gitignore.js"() {
     import_promises4 = require("node:fs/promises");
-    import_node_path4 = __toESM(require("node:path"), 1);
+    import_node_path5 = __toESM(require("node:path"), 1);
     BLOCK_START = "# >>> zapwebp >>>";
     BLOCK_END = "# <<< zapwebp <<<";
   }
@@ -8491,12 +9508,12 @@ var init_gitignore = __esm({
 // packages/cli/src/config.js
 async function loadConfigFile(rootDir, explicitConfigPath) {
   if (explicitConfigPath) {
-    const full = import_node_path5.default.resolve(rootDir, explicitConfigPath);
+    const full = import_node_path6.default.resolve(rootDir, explicitConfigPath);
     const content = await (0, import_promises5.readFile)(full, "utf8");
     return { config: JSON.parse(content), filePath: full };
   }
   for (const filename of CONFIG_FILENAMES) {
-    const full = import_node_path5.default.join(rootDir, filename);
+    const full = import_node_path6.default.join(rootDir, filename);
     const exists = await (0, import_promises5.stat)(full).then((s) => s.isFile(), () => false);
     if (exists) {
       try {
@@ -8595,16 +9612,34 @@ function resolveConfigPrecedence({ cliOptions = {}, fileConfig = {}, env = proce
       origins[field] = "default";
     }
   }
+  const baseLimits = fileConfig.limits || {};
+  const resolvedLimits = { ...baseLimits };
+  if (cliOptions.unlimited) {
+    resolvedLimits.maxFilesPerRequest = null;
+    resolvedLimits.maxFilesPerSession = null;
+    resolvedLimits.maxBytesPerRequest = null;
+  }
+  if (cliOptions.maxFiles !== void 0) {
+    resolvedLimits.maxFilesPerRequest = cliOptions.maxFiles === 0 ? null : cliOptions.maxFiles;
+  }
+  if (cliOptions.maxBytes !== void 0) {
+    resolvedLimits.maxBytesPerRequest = cliOptions.maxBytes === 0 ? null : cliOptions.maxBytes;
+  }
+  if (cliOptions.concurrency !== void 0) {
+    resolvedLimits.maxConcurrent = cliOptions.concurrency;
+  }
+  resolved.limits = (0, import_shared3.resolveLimits)(resolvedLimits);
+  origins.limits = cliOptions.unlimited || cliOptions.maxFiles !== void 0 || cliOptions.maxBytes !== void 0 || cliOptions.concurrency !== void 0 ? "cli_flag" : fileConfig.limits !== void 0 ? "config_file" : "default";
   return { resolved, origins };
 }
-var import_promises5, import_node_path5, import_shared2, CONFIG_FILENAMES, DEFAULT_CONFIG;
+var import_promises5, import_node_path6, import_shared3, CONFIG_FILENAMES, DEFAULT_CONFIG;
 var init_config = __esm({
   "packages/cli/src/config.js"() {
     import_promises5 = require("node:fs/promises");
-    import_node_path5 = __toESM(require("node:path"), 1);
-    import_shared2 = __toESM(require_src(), 1);
+    import_node_path6 = __toESM(require("node:path"), 1);
+    import_shared3 = __toESM(require_src(), 1);
     CONFIG_FILENAMES = [
-      import_node_path5.default.join(".zapwebp", "config.json"),
+      import_node_path6.default.join(".zapwebp", "config.json"),
       ".zapwebp/config.json",
       ".zapwebp.config.json",
       "zapwebp.config.json",
@@ -8612,13 +9647,13 @@ var init_config = __esm({
       ".zapwebp.json"
     ];
     DEFAULT_CONFIG = {
-      format: import_shared2.DEFAULT_OPTIONS.to,
-      quality: import_shared2.DEFAULT_OPTIONS.quality,
-      lossless: import_shared2.DEFAULT_OPTIONS.lossless,
-      effort: import_shared2.DEFAULT_OPTIONS.effort,
-      scales: [...import_shared2.DEFAULT_OPTIONS.scale],
-      baseWidth: import_shared2.DEFAULT_OPTIONS.baseWidth,
-      clean: import_shared2.DEFAULT_OPTIONS.clean,
+      format: import_shared3.DEFAULT_OPTIONS.to,
+      quality: import_shared3.DEFAULT_OPTIONS.quality,
+      lossless: import_shared3.DEFAULT_OPTIONS.lossless,
+      effort: import_shared3.DEFAULT_OPTIONS.effort,
+      scales: [...import_shared3.DEFAULT_OPTIONS.scale],
+      baseWidth: import_shared3.DEFAULT_OPTIONS.baseWidth,
+      clean: import_shared3.DEFAULT_OPTIONS.clean,
       maxFileSizeBytes: 10 * 1024 * 1024,
       followSymlinks: false,
       allowOutsideRoot: false,
@@ -8630,13 +9665,515 @@ var init_config = __esm({
       gitignore: {
         outputs: "auto",
         journal: "auto"
-      }
+      },
+      limits: import_shared3.DEFAULT_LIMITS
     };
+  }
+});
+
+// packages/lock/src/lock.js
+var require_lock = __commonJS({
+  "packages/lock/src/lock.js"(exports2, module2) {
+    "use strict";
+    var crypto3 = require("node:crypto");
+    var LOCK_VERSION = "1";
+    var ENGINE_VERSION = "2.26.0";
+    var LOCK_KEYWORD = "zapwebp:lock";
+    var CRC_TABLE = new Int32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) {
+        c = c & 1 ? 3988292384 ^ c >>> 1 : c >>> 1;
+      }
+      CRC_TABLE[n] = c;
+    }
+    function crc32(buf) {
+      let c = -1;
+      for (let i = 0; i < buf.length; i++) {
+        c = CRC_TABLE[(c ^ buf[i]) & 255] ^ c >>> 8;
+      }
+      return (c ^ -1) >>> 0;
+    }
+    function computeOptionsHash(options = {}) {
+      const canonical = {
+        background: options.background ? String(options.background).toLowerCase().trim() : null,
+        clean: Boolean(options.clean),
+        fit: options.fit ? String(options.fit).toLowerCase().trim() : "cover",
+        height: options.height ? Number(options.height) : null,
+        lossless: Boolean(options.lossless),
+        plugins: Array.isArray(options.plugins) ? options.plugins.map((p) => typeof p === "string" ? p : p?.name).filter(Boolean).sort() : [],
+        quality: options.quality !== void 0 ? Number(options.quality) : 85,
+        to: options.to ? String(options.to).toLowerCase().trim() : "webp",
+        transforms: Array.isArray(options.transforms) ? options.transforms.map((t2) => typeof t2 === "string" ? t2 : t2?.name).filter(Boolean).sort() : [],
+        width: options.width ? Number(options.width) : null
+      };
+      const serialized = JSON.stringify(canonical, Object.keys(canonical).sort());
+      return crypto3.createHash("sha256").update(serialized).digest("hex");
+    }
+    function createLockFingerprint({ input, options = {}, engineVersion = ENGINE_VERSION, convertedAt }) {
+      const inputBuf = Buffer.isBuffer(input) ? input : Buffer.from(input || []);
+      const inputSha256 = crypto3.createHash("sha256").update(inputBuf).digest("hex");
+      const optionsSha256 = computeOptionsHash(options);
+      return {
+        "zapwebp:lock": {
+          version: LOCK_VERSION,
+          inputSha256,
+          optionsSha256,
+          engineVersion,
+          convertedAt: convertedAt || options.convertedAt || (process.env.SOURCE_DATE_EPOCH ? new Date(Number(process.env.SOURCE_DATE_EPOCH) * 1e3).toISOString() : "1970-01-01T00:00:00.000Z"),
+          optionsSummary: {
+            to: options.to ? String(options.to).toLowerCase() : "webp",
+            quality: options.quality !== void 0 ? Number(options.quality) : 85,
+            clean: Boolean(options.clean),
+            lossless: Boolean(options.lossless),
+            width: options.width ? Number(options.width) : void 0,
+            height: options.height ? Number(options.height) : void 0,
+            background: options.background || void 0
+          }
+        }
+      };
+    }
+    function writeLock(buffer, format, lockData) {
+      if (!buffer || !buffer.length) return Buffer.from([]);
+      const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+      const fmt = (format || "").toLowerCase();
+      const jsonStr = JSON.stringify(lockData);
+      if (fmt === "webp" && buf.length >= 12 && buf.subarray(0, 4).toString("ascii") === "RIFF") {
+        const payload = Buffer.from(jsonStr, "utf8");
+        const chunkLen = payload.length;
+        const pad = chunkLen % 2;
+        const chunk = Buffer.alloc(8 + chunkLen + pad);
+        chunk.write("ZAPL", 0, 4, "ascii");
+        chunk.writeUInt32LE(chunkLen, 4);
+        payload.copy(chunk, 8);
+        const out = Buffer.concat([buf, chunk]);
+        out.writeUInt32LE(out.length - 8, 4);
+        return out;
+      }
+      if (fmt === "png" && buf.length >= 24 && buf[0] === 137 && buf[1] === 80) {
+        const keyword = LOCK_KEYWORD;
+        const textData = Buffer.concat([
+          Buffer.from(keyword + "\0", "latin1"),
+          Buffer.from(jsonStr, "utf8")
+        ]);
+        const chunkLen = Buffer.alloc(4);
+        chunkLen.writeUInt32BE(textData.length, 0);
+        const chunkType = Buffer.from("tEXt", "ascii");
+        const crcData = Buffer.concat([chunkType, textData]);
+        const chunkCrc = Buffer.alloc(4);
+        chunkCrc.writeUInt32BE(crc32(crcData), 0);
+        const tExtChunk = Buffer.concat([chunkLen, chunkType, textData, chunkCrc]);
+        const iendOffset = buf.lastIndexOf(Buffer.from("IEND", "ascii"));
+        if (iendOffset >= 4) {
+          const beforeIend = buf.subarray(0, iendOffset - 4);
+          const iendAndAfter = buf.subarray(iendOffset - 4);
+          return Buffer.concat([beforeIend, tExtChunk, iendAndAfter]);
+        }
+      }
+      if ((fmt === "jpeg" || fmt === "jpg") && buf.length >= 2 && buf[0] === 255 && buf[1] === 216) {
+        const payload = Buffer.from(`${LOCK_KEYWORD}:${jsonStr}`, "utf8");
+        if (payload.length <= 65530) {
+          const markerLen = payload.length + 2;
+          const comMarker = Buffer.alloc(4 + payload.length);
+          comMarker[0] = 255;
+          comMarker[1] = 254;
+          comMarker.writeUInt16BE(markerLen, 2);
+          payload.copy(comMarker, 4);
+          return Buffer.concat([buf.subarray(0, 2), comMarker, buf.subarray(2)]);
+        }
+      }
+      if (fmt === "svg") {
+        const str = buf.toString("utf8");
+        const tag = `<metadata id="zapwebp-lock"><script type="application/json">${jsonStr}</script></metadata>`;
+        const closingTagIndex = str.lastIndexOf("</svg>");
+        if (closingTagIndex !== -1) {
+          const updated = str.slice(0, closingTagIndex) + tag + str.slice(closingTagIndex);
+          return Buffer.from(updated, "utf8");
+        }
+        return Buffer.concat([buf, Buffer.from(tag, "utf8")]);
+      }
+      return buf;
+    }
+    function readLock(buffer, format) {
+      if (!buffer || !buffer.length) return null;
+      const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+      const fmt = (format || detectFormat3(buf) || "").toLowerCase();
+      try {
+        if (fmt === "webp" && buf.length >= 12 && buf.subarray(0, 4).toString("ascii") === "RIFF") {
+          let offset = 12;
+          while (offset + 8 <= buf.length) {
+            const fourcc = buf.toString("ascii", offset, offset + 4);
+            const chunkSize = buf.readUInt32LE(offset + 4);
+            const chunkEnd = offset + 8 + chunkSize;
+            if (fourcc === "ZAPL" && chunkEnd <= buf.length) {
+              const payload = buf.subarray(offset + 8, chunkEnd).toString("utf8");
+              const parsed = JSON.parse(payload);
+              return parsed["zapwebp:lock"] || parsed;
+            }
+            offset += 8 + chunkSize + (chunkSize & 1);
+          }
+        }
+        if (fmt === "png" && buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+          let offset = 8;
+          while (offset + 8 <= buf.length) {
+            const length = buf.readUInt32BE(offset);
+            const type = buf.subarray(offset + 4, offset + 8).toString("ascii");
+            if (type === "tEXt" || type === "iTXt") {
+              const chunkData = buf.subarray(offset + 8, Math.min(offset + 8 + length, buf.length));
+              const nullIdx = chunkData.indexOf(0);
+              if (nullIdx !== -1) {
+                const keyword = chunkData.subarray(0, nullIdx).toString("latin1");
+                if (keyword === LOCK_KEYWORD) {
+                  const text = chunkData.subarray(nullIdx + 1).toString("utf8");
+                  const parsed = JSON.parse(text);
+                  return parsed["zapwebp:lock"] || parsed;
+                }
+              }
+            }
+            offset += 12 + length;
+          }
+        }
+        if ((fmt === "jpeg" || fmt === "jpg") && buf.length >= 4 && buf[0] === 255 && buf[1] === 216) {
+          let offset = 2;
+          while (offset < buf.length) {
+            if (buf[offset] !== 255) break;
+            while (buf[offset] === 255) offset++;
+            if (offset >= buf.length) break;
+            const marker = buf[offset++];
+            if (marker === 217 || marker === 218) break;
+            if (offset + 2 > buf.length) break;
+            const length = buf.readUInt16BE(offset);
+            const segEnd = offset + length;
+            if (segEnd > buf.length) break;
+            if (marker === 254) {
+              const payload = buf.subarray(offset + 2, segEnd).toString("utf8");
+              if (payload.startsWith(`${LOCK_KEYWORD}:`)) {
+                const jsonText = payload.slice(LOCK_KEYWORD.length + 1);
+                const parsed = JSON.parse(jsonText);
+                return parsed["zapwebp:lock"] || parsed;
+              }
+            }
+            offset = segEnd;
+          }
+        }
+        if (fmt === "svg" || buf.length >= 4 && buf.toString("utf8", 0, 100).includes("<svg")) {
+          const str = buf.toString("utf8");
+          const match = str.match(/<metadata id="zapwebp-lock">\s*<script type="application\/json">([\s\S]*?)<\/script>\s*<\/metadata>/i);
+          if (match && match[1]) {
+            const parsed = JSON.parse(match[1]);
+            return parsed["zapwebp:lock"] || parsed;
+          }
+        }
+      } catch {
+        return null;
+      }
+      return null;
+    }
+    function detectFormat3(buf) {
+      if (!buf || buf.length < 4) return null;
+      if (buf[0] === 255 && buf[1] === 216) return "jpeg";
+      if (buf[0] === 137 && buf[1] === 80 && buf[2] === 78 && buf[3] === 71) return "png";
+      if (buf.length >= 12 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") return "webp";
+      if (buf.toString("utf8", 0, 100).includes("<svg")) return "svg";
+      return null;
+    }
+    function verifyLock(existingBuffer, currentInputBuffer, currentOptions = {}, lockOptions = {}) {
+      const force = Boolean(lockOptions.force || currentOptions.force);
+      if (force) {
+        return {
+          enabled: true,
+          detected: false,
+          match: false,
+          skipped: false,
+          reason: "forced"
+        };
+      }
+      if (!existingBuffer || !existingBuffer.length) {
+        return {
+          enabled: true,
+          detected: false,
+          match: false,
+          skipped: false,
+          reason: "no_existing_file"
+        };
+      }
+      const existingLock = readLock(existingBuffer);
+      if (!existingLock) {
+        return {
+          enabled: true,
+          detected: false,
+          match: false,
+          skipped: false,
+          reason: "no_lock_present"
+        };
+      }
+      const activeEngineVersion = lockOptions.engineVersion || ENGINE_VERSION;
+      const invalidateOnEngineChange = lockOptions.invalidateOnEngineChange !== false;
+      if (invalidateOnEngineChange && existingLock.engineVersion && existingLock.engineVersion !== activeEngineVersion) {
+        return {
+          enabled: true,
+          detected: true,
+          match: false,
+          skipped: false,
+          reason: "engine_version_mismatch",
+          storedEngineVersion: existingLock.engineVersion,
+          currentEngineVersion: activeEngineVersion,
+          lock: existingLock
+        };
+      }
+      const currentOptionsHash = computeOptionsHash(currentOptions);
+      if (existingLock.optionsSha256 && existingLock.optionsSha256 !== currentOptionsHash) {
+        return {
+          enabled: true,
+          detected: true,
+          match: false,
+          skipped: false,
+          reason: "options_hash_mismatch",
+          storedOptionsHash: existingLock.optionsSha256,
+          currentOptionsHash,
+          lock: existingLock
+        };
+      }
+      if (currentInputBuffer && currentInputBuffer.length) {
+        const inputBuf = Buffer.isBuffer(currentInputBuffer) ? currentInputBuffer : Buffer.from(currentInputBuffer);
+        const currentInputHash = crypto3.createHash("sha256").update(inputBuf).digest("hex");
+        if (existingLock.inputSha256 && existingLock.inputSha256 !== currentInputHash) {
+          return {
+            enabled: true,
+            detected: true,
+            match: false,
+            skipped: false,
+            reason: "input_hash_mismatch",
+            storedInputHash: existingLock.inputSha256,
+            currentInputHash,
+            lock: existingLock
+          };
+        }
+      }
+      return {
+        enabled: true,
+        detected: true,
+        match: true,
+        skipped: true,
+        reason: "options_hash_match",
+        inputSha256: existingLock.inputSha256,
+        optionsSha256: existingLock.optionsSha256,
+        engineVersion: existingLock.engineVersion,
+        convertedAt: existingLock.convertedAt,
+        optionsSummary: existingLock.optionsSummary,
+        lock: existingLock
+      };
+    }
+    function createLockPlugin(pluginOptions = {}) {
+      const defaultOpts = {
+        enabled: true,
+        force: false,
+        invalidateOnEngineChange: true,
+        engineVersion: ENGINE_VERSION,
+        ...pluginOptions
+      };
+      return {
+        name: "@zapwebp/lock",
+        version: "1.0.0",
+        hooks: {
+          /**
+           * Before conversion hook: checks if destination or source has a valid matching lock.
+           */
+          async beforeConvert(context) {
+            if (!defaultOpts.enabled || context.force || defaultOpts.force) {
+              return context;
+            }
+            const existing = context.existingBuffer || context.destinationBuffer;
+            if (existing) {
+              const verification = verifyLock(
+                existing,
+                context.input,
+                context.options,
+                defaultOpts
+              );
+              if (verification.match) {
+                return {
+                  ...context,
+                  skipConversion: true,
+                  output: existing,
+                  lock: verification
+                };
+              }
+            }
+            return context;
+          },
+          /**
+           * After conversion hook: injects the cryptographic lock fingerprint into the output.
+           */
+          async afterConvert(context, outputs) {
+            if (!defaultOpts.enabled || context.noLock || context.skipConversion) {
+              return outputs;
+            }
+            const outList = Array.isArray(outputs) ? outputs : [outputs];
+            return outList.map((out) => {
+              if (!out || !out.data || !out.format) return out;
+              const fingerprint = createLockFingerprint({
+                input: context.input,
+                options: context.options,
+                engineVersion: defaultOpts.engineVersion
+              });
+              const lockedData = writeLock(out.data, out.format, fingerprint);
+              return {
+                ...out,
+                data: lockedData,
+                size: lockedData.length,
+                lock: {
+                  enabled: true,
+                  detected: false,
+                  match: false,
+                  skipped: false,
+                  ...fingerprint["zapwebp:lock"]
+                }
+              };
+            });
+          }
+        }
+      };
+    }
+    module2.exports = {
+      LOCK_VERSION,
+      ENGINE_VERSION,
+      LOCK_KEYWORD,
+      computeOptionsHash,
+      createLockFingerprint,
+      writeLock,
+      readLock,
+      verifyLock,
+      createLockPlugin
+    };
+  }
+});
+
+// packages/lock/src/index.js
+var require_src3 = __commonJS({
+  "packages/lock/src/index.js"(exports2) {
+    "use strict";
+    var lockModule = require_lock();
+    exports2.LOCK_VERSION = lockModule.LOCK_VERSION;
+    exports2.ENGINE_VERSION = lockModule.ENGINE_VERSION;
+    exports2.LOCK_KEYWORD = lockModule.LOCK_KEYWORD;
+    exports2.computeOptionsHash = lockModule.computeOptionsHash;
+    exports2.createLockFingerprint = lockModule.createLockFingerprint;
+    exports2.writeLock = lockModule.writeLock;
+    exports2.readLock = lockModule.readLock;
+    exports2.verifyLock = lockModule.verifyLock;
+    exports2.createLockPlugin = lockModule.createLockPlugin;
+    exports2.lockPlugin = lockModule.createLockPlugin;
+    exports2.default = lockModule.createLockPlugin;
   }
 });
 
 // packages/cli/src/index.js
 var src_exports = {};
+function getHelpText() {
+  return `${t("cli.description")}
+
+USAGE
+  ${t("cli.usage")}
+  zap <command> [options]
+
+${t("cli.commands_header")}
+  init              ${t("cmd.init")} (--team for policy)
+  watch             ${t("cmd.watch")}
+  report [path]     ${t("cmd.report")}
+  policy <cmd>      ${t("cmd.policy")}
+  audit             ${t("cmd.audit")}
+  check             ${t("cmd.check")}
+  explain <file>    ${t("cmd.explain")}
+  ignored [dir]     ${t("cmd.ignored")}
+  history           ${t("cmd.history")}
+  undo [id|step]    ${t("cmd.undo")}
+  redo [id]         ${t("cmd.redo")}
+  show <id>         ${t("cmd.show")}
+  gc                ${t("cmd.gc")}
+  gitignore <subcmd> ${t("cmd.gitignore")}
+  config show       ${t("cmd.config")}
+  doctor            ${t("cmd.doctor")}
+  inspect <image>   ${t("cmd.inspect")}
+  explain-black-bg  ${t("cmd.explain_black_bg")}
+
+${t("cli.options_header")}
+  -o, --output <file>     ${t("flag.output")}
+      --out-dir <dir>     ${t("flag.out_dir")}
+      --to <formats>      ${t("flag.to")}
+      --from <format>     ${t("flag.from")}
+      --smart             ${t("flag.smart")}
+      --explain           ${t("flag.explain")}
+      --since <period>    ${t("flag.since")}
+      --team              ${t("flag.team")}
+      --scale <scales>    ${t("flag.scale")}
+      --base-width <px>   ${t("flag.base_width")}
+      --width <px>        ${t("flag.width")}
+      --height <px>       ${t("flag.height")}
+      --fit <mode>        ${t("flag.fit")}
+  -q, --quality <0-100>   ${t("flag.quality")}
+      --lossless          ${t("flag.lossless")}
+      --effort <0-9>      ${t("flag.effort")}
+      --background <col>  ${t("flag.background")}
+      --clean             ${t("flag.clean")}
+      --no-clean          ${t("flag.no_clean")}
+      --verify <hash>     ${t("flag.verify")}
+      --verify-clean      ${t("flag.verify_clean")}
+      --assert-alpha      ${t("flag.assert_alpha")}
+      --lock-target <fmt> ${t("flag.lock_target")}
+      --strict            ${t("flag.strict")}
+      --no-strict         ${t("flag.no_strict")}
+      --same-format <mod> ${t("flag.same_format")}
+      --size-mode <mode>  ${t("flag.size_mode")}
+      --flexible          ${t("flag.flexible")}
+      --min-input <bytes> ${t("flag.min_input")}
+      --max-input <bytes> ${t("flag.max_input")}
+      --min-output <byte> ${t("flag.min_output")}
+      --max-output <byte> ${t("flag.max_output")}
+      --target <size>     ${t("flag.target")}
+      --min-quality <q>   ${t("flag.min_quality")}
+      --no-downscale      ${t("flag.no_downscale")}
+      --no-lock           ${t("flag.no_lock")}
+      --lock-status       ${t("flag.lock_status")}
+      --override-lock     ${t("flag.override_lock")}
+      --zip               ${t("flag.zip")}
+      --srcset            ${t("flag.srcset")}
+      --changed           ${t("flag.changed")}
+      --staged            ${t("flag.staged")}
+      --include-ignored   ${t("flag.include_ignored")}
+      --include-all       ${t("flag.include_all")}
+      --follow-symlinks   ${t("flag.follow_symlinks")}
+      --allow-outside     ${t("flag.allow_outside")}
+      --allow-unsafe      ${t("flag.allow_unsafe")}
+  -f, --force             ${t("flag.force")}
+      --force-undo        ${t("flag.force_undo")}
+      --commit-outputs    ${t("flag.commit_outputs")}
+      --gitignore=off     ${t("flag.gitignore")}
+      --stdin             ${t("flag.stdin")}
+      --manifest          ${t("flag.manifest")}
+      --dry-run           ${t("flag.dry_run")}
+      --json              ${t("flag.json")}
+      --config <file>     ${t("flag.config")}
+      --max-files <n>     ${t("flag.max_files")}
+      --unlimited         ${t("flag.unlimited")}
+      --concurrency <n>   ${t("flag.concurrency")}
+      --max-bytes <size>  ${t("flag.max_bytes")}
+      --reset-session     ${t("flag.reset_session")}
+      --lang <code>       ${t("flag.lang")}
+  -h, --help              ${t("flag.help")}
+
+${t("cli.safety_header")}
+  \u2022 ${t("cli.safety_telemetry")}
+  \u2022 ${t("cli.safety_reversible")}
+  \u2022 ${t("cli.safety_toctou")}
+  \u2022 ${t("cli.safety_atomic")}
+
+${t("cli.exit_codes_header")}
+  0   ${t("exit.0")}
+  1   ${t("exit.1")}
+  2   ${t("exit.2")}
+`;
+}
 function parseByteSize(val) {
   if (typeof val === "number") return val;
   const str = String(val).trim();
@@ -8746,7 +10283,15 @@ function parseArgs(argv) {
       parsed.options.overrideLock = true;
     } else if (arg === "--clean") parsed.options.clean = true;
     else if (arg === "--no-clean") parsed.options.clean = false;
-    else if (arg === "--delete-original") {
+    else if (arg === "--force" || arg === "-f") {
+      parsed.force = true;
+      parsed.options.force = true;
+    } else if (arg === "--no-lock") {
+      parsed.noLock = true;
+      parsed.options.noLock = true;
+    } else if (arg === "--lock-status") {
+      parsed.lockStatus = true;
+    } else if (arg === "--delete-original") {
       parsed.deleteOriginal = true;
       parsed.options.keepOriginal = false;
     } else if (arg === "--keep-original") {
@@ -8812,7 +10357,27 @@ function parseArgs(argv) {
     else if (arg === "--commit-outputs") parsed.commitOutputs = true;
     else if (arg === "--gitignore=off") parsed.gitignoreOff = true;
     else if (arg === "--hook") parsed.hook = true;
-    else if (arg === "--scale" || arg === "--scales") {
+    else if (arg === "--max-files") {
+      const value = argv[++i];
+      if (!value) throw new Error(`${arg} requires a number.`);
+      parsed.maxFiles = Number(value);
+      parsed.options.maxFiles = Number(value);
+    } else if (arg === "--unlimited") {
+      parsed.unlimited = true;
+      parsed.options.unlimited = true;
+    } else if (arg === "--concurrency") {
+      const value = argv[++i];
+      if (!value) throw new Error(`${arg} requires a number.`);
+      parsed.concurrency = Number(value);
+      parsed.options.concurrency = Number(value);
+    } else if (arg === "--max-bytes") {
+      const value = argv[++i];
+      if (!value) throw new Error(`${arg} requires a byte size (e.g. 100MB).`);
+      parsed.maxBytes = parseByteSize(value);
+      parsed.options.maxBytes = parseByteSize(value);
+    } else if (arg === "--reset-session") {
+      parsed.resetSession = true;
+    } else if (arg === "--scale" || arg === "--scales") {
       const value = argv[++i];
       if (!value) throw new Error(`${arg} needs a multiplier value, e.g. 1,2,3`);
       parsed.scales = parseScales(value);
@@ -8841,12 +10406,12 @@ async function writeAtomic(filePath, data) {
 }
 function commonDirectory(paths) {
   if (!paths || !paths.length) return process.cwd();
-  const resolved = paths.map((p) => import_node_path6.default.resolve(p));
-  let common = import_node_path6.default.extname(resolved[0]) ? import_node_path6.default.dirname(resolved[0]) : resolved[0];
+  const resolved = paths.map((p) => import_node_path7.default.resolve(p));
+  let common = import_node_path7.default.extname(resolved[0]) ? import_node_path7.default.dirname(resolved[0]) : resolved[0];
   for (let i = 0; i < resolved.length; i++) {
     const item = resolved[i];
-    while (!item.startsWith(common + import_node_path6.default.sep) && item !== common) {
-      const parent = import_node_path6.default.dirname(common);
+    while (!item.startsWith(common + import_node_path7.default.sep) && item !== common) {
+      const parent = import_node_path7.default.dirname(common);
       if (parent === common) break;
       common = parent;
     }
@@ -8857,11 +10422,11 @@ function inputRootForPatterns(patterns, files, rootDir = process.cwd()) {
   const roots = [];
   for (const pat of patterns) {
     if (pat === "-" || pat.startsWith("-")) continue;
-    const resolved = import_node_path6.default.resolve(rootDir, pat);
+    const resolved = import_node_path7.default.resolve(rootDir, pat);
     const magicIndex = resolved.search(/[*?{}[\]]/);
     if (magicIndex !== -1) {
       const prefix = resolved.slice(0, magicIndex);
-      const lastSep = prefix.lastIndexOf(import_node_path6.default.sep);
+      const lastSep = prefix.lastIndexOf(import_node_path7.default.sep);
       roots.push(lastSep !== -1 ? prefix.slice(0, lastSep) : prefix);
     }
   }
@@ -8872,7 +10437,7 @@ function inputRootForPatterns(patterns, files, rootDir = process.cwd()) {
     return commonDirectory(files);
   }
   if (files && files.length === 1) {
-    return import_node_path6.default.dirname(import_node_path6.default.resolve(files[0]));
+    return import_node_path7.default.dirname(import_node_path7.default.resolve(files[0]));
   }
   return rootDir;
 }
@@ -8881,28 +10446,72 @@ function outputFor(input, inputs, output, outDir, inputRoot, target, scale = 1) 
   const suffix = scaleSuffix(scale);
   let destination;
   if (output && inputs.length === 1 && !output.endsWith(".zip")) {
-    const ext = import_node_path6.default.extname(output);
+    const ext = import_node_path7.default.extname(output);
     const base = output.slice(0, -ext.length);
-    destination = scale === 1 ? import_node_path6.default.resolve(output) : import_node_path6.default.resolve(`${base}${suffix}${ext}`);
+    destination = scale === 1 ? import_node_path7.default.resolve(output) : import_node_path7.default.resolve(`${base}${suffix}${ext}`);
   } else if (!outDir) {
-    destination = import_node_path6.default.join(import_node_path6.default.dirname(input), outputName(input, target, scale));
+    destination = import_node_path7.default.join(import_node_path7.default.dirname(input), outputName(input, target, scale));
   } else {
-    const rel = import_node_path6.default.relative(inputRoot, input);
-    const relPath = rel.startsWith("..") ? import_node_path6.default.basename(input) : rel;
-    destination = import_node_path6.default.join(outDir, relPath.replace(/\.[^.]+$/, `${suffix}.${extension}`));
+    const rel = import_node_path7.default.relative(inputRoot, input);
+    const relPath = rel.startsWith("..") ? import_node_path7.default.basename(input) : rel;
+    destination = import_node_path7.default.join(outDir, relPath.replace(/\.[^.]+$/, `${suffix}.${extension}`));
   }
   return destination;
 }
 async function main() {
   const rootDir = process.cwd();
   const args = parseArgs(process.argv.slice(2));
+  const locale = args.lang || process.env.ZAPWEBP_LANG || (process.env.LANG ? process.env.LANG.split(/[-_.@]/)[0].toLowerCase() : "en");
+  setLocale(locale);
   if (args.help) {
-    process.stdout.write(HELP);
+    process.stdout.write(getHelpText());
+    return;
+  }
+  if (args.lockStatus) {
+    const targetFile = args.inputs[0];
+    if (!targetFile) {
+      process.stderr.write("Error: --lock-status requires a target file path.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const fullPath = import_node_path7.default.resolve(rootDir, targetFile);
+    const fileBytes = await (0, import_promises6.readFile)(fullPath).catch(() => null);
+    if (!fileBytes) {
+      process.stderr.write(`Error: Cannot read file: ${targetFile}
+`);
+      process.exitCode = 1;
+      return;
+    }
+    const { readLock } = await Promise.resolve().then(() => __toESM(require_src3(), 1));
+    const lock = readLock(fileBytes);
+    if (!lock) {
+      process.stdout.write("Lock: not present (file has not been locked by Zapwebp)\n");
+      return;
+    }
+    process.stdout.write("Lock: present\n");
+    process.stdout.write(`  Input SHA-256:    ${lock.inputSha256 || "n/a"}
+`);
+    process.stdout.write(`  Options SHA-256:  ${lock.optionsSha256 || "n/a"}
+`);
+    process.stdout.write(`  Engine version:   ${lock.engineVersion || "n/a"}
+`);
+    process.stdout.write(`  Converted at:     ${lock.convertedAt || "n/a"}
+`);
+    if (lock.optionsSummary) {
+      const summaryList = Object.entries(lock.optionsSummary).filter(([, v]) => v !== void 0 && v !== null).map(([k, v]) => `${k} ${v}`).join(", ");
+      process.stdout.write(`  Options:          ${summaryList}
+`);
+    }
+    return;
+  }
+  if (args.resetSession) {
+    await resetSession(rootDir);
+    process.stdout.write("\u2713 Session reset. Processed files count is now 0.\n");
     return;
   }
   if (args.inputs[0] === "init") {
-    const configPath = import_node_path6.default.join(rootDir, ".zapwebp.config.json");
-    const zapignorePath = import_node_path6.default.join(rootDir, ".zapwebpignore");
+    const configPath = import_node_path7.default.join(rootDir, ".zapwebp.config.json");
+    const zapignorePath = import_node_path7.default.join(rootDir, ".zapwebpignore");
     const starterConfig = {
       format: DEFAULT_OPTIONS2.to,
       quality: DEFAULT_OPTIONS2.quality,
@@ -8921,14 +10530,14 @@ src/icons/legacy/**
     await writeAtomic(zapignorePath, starterIgnore);
     await syncGitignore(rootDir, { outDir: "public/icons", commitOutputs: args.commitOutputs, gitignoreMode: "always" });
     if (args.hook) {
-      const hookPath = import_node_path6.default.join(rootDir, ".git", "hooks", "pre-commit");
-      if (await (0, import_promises6.stat)(import_node_path6.default.dirname(hookPath)).then(() => true, () => false)) {
+      const hookPath = import_node_path7.default.join(rootDir, ".git", "hooks", "pre-commit");
+      if (await (0, import_promises6.stat)(import_node_path7.default.dirname(hookPath)).then(() => true, () => false)) {
         await (0, import_promises6.writeFile)(hookPath, "#!/bin/sh\nzap --staged --check\n", { mode: 493 });
         process.stdout.write("\u2713 Installed Git pre-commit hook (.git/hooks/pre-commit)\n");
       }
     }
     if (args.team) {
-      const policyPath = import_node_path6.default.join(rootDir, "zapwebp.policy.json");
+      const policyPath = import_node_path7.default.join(rootDir, "zapwebp.policy.json");
       await writeAtomic(policyPath, JSON.stringify(DEFAULT_TEAM_POLICY_TEMPLATE, null, 2) + "\n");
       process.stdout.write("  - Created zapwebp.policy.json (Team Governance Policy)\n");
     }
@@ -9048,7 +10657,7 @@ Operations:
   }
   if (args.inputs[0] === "policy") {
     const action = args.inputs[1];
-    const policyPath = import_node_path6.default.join(rootDir, "zapwebp.policy.json");
+    const policyPath = import_node_path7.default.join(rootDir, "zapwebp.policy.json");
     const exists = await (0, import_promises6.stat)(policyPath).then(() => true, () => false);
     if (!exists) {
       throw new Error('zapwebp.policy.json not found in project root. Run "zap init --team" to generate a policy template.');
@@ -9163,7 +10772,7 @@ Zap Solution:
   if (args.inputs[0] === "inspect") {
     const fileToInspect = args.inputs[1];
     if (!fileToInspect) throw new Error("The inspect command requires an image file path.");
-    const inputData = await (0, import_promises6.readFile)(import_node_path6.default.resolve(fileToInspect));
+    const inputData = await (0, import_promises6.readFile)(import_node_path7.default.resolve(fileToInspect));
     const result = await inspectImage(inputData);
     if (args.json) {
       process.stdout.write(JSON.stringify(result, null, 2) + "\n");
@@ -9210,20 +10819,20 @@ File: ${fileToInspect}
     configIgnores: fileConfig.ignore
   });
   if (args.inputs[0] === "ignored") {
-    const targetDir = import_node_path6.default.resolve(args.inputs[1] || ".");
+    const targetDir = import_node_path7.default.resolve(args.inputs[1] || ".");
     const matched = [];
     for await (const file of (0, import_promises6.glob)("**/*", { cwd: targetDir, nodir: true })) {
-      const full = import_node_path6.default.resolve(targetDir, file);
+      const full = import_node_path7.default.resolve(targetDir, file);
       const res = ignoreChecker.isIgnored(full);
       if (res.ignored) {
-        matched.push({ path: import_node_path6.default.relative(rootDir, full), ...res });
+        matched.push({ path: import_node_path7.default.relative(rootDir, full), ...res });
       }
     }
     if (args.json) {
       process.stdout.write(JSON.stringify(matched, null, 2) + "\n");
     } else {
       process.stdout.write(`
-Ignored Files in ${import_node_path6.default.relative(rootDir, targetDir) || "."}:
+Ignored Files in ${import_node_path7.default.relative(rootDir, targetDir) || "."}:
 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 `);
       for (const m of matched) {
@@ -9274,7 +10883,7 @@ File: ${targetFile}
   }
   let rawCandidates = [];
   if (args.here && !args.inputs.length) {
-    for await (const f of (0, import_promises6.glob)("*", { cwd: rootDir, nodir: true })) rawCandidates.push(import_node_path6.default.resolve(rootDir, f));
+    for await (const f of (0, import_promises6.glob)("*", { cwd: rootDir, nodir: true })) rawCandidates.push(import_node_path7.default.resolve(rootDir, f));
   } else if (args.changed) {
     rawCandidates = getGitFiles("changed", rootDir);
   } else if (args.staged) {
@@ -9282,7 +10891,7 @@ File: ${targetFile}
   } else if (args.inputs[0] === "audit") {
     const patterns = args.inputs.slice(1).length ? args.inputs.slice(1) : ["**/*"];
     for (const pat of patterns) {
-      for await (const f of (0, import_promises6.glob)(pat, { cwd: rootDir, nodir: true })) rawCandidates.push(import_node_path6.default.resolve(rootDir, f));
+      for await (const f of (0, import_promises6.glob)(pat, { cwd: rootDir, nodir: true })) rawCandidates.push(import_node_path7.default.resolve(rootDir, f));
     }
   } else if (args.inputs.length) {
     for (const pat of args.inputs) {
@@ -9291,23 +10900,23 @@ File: ${targetFile}
         continue;
       }
       if (!/[*?{}[\]]/.test(pat)) {
-        rawCandidates.push(import_node_path6.default.resolve(rootDir, pat));
+        rawCandidates.push(import_node_path7.default.resolve(rootDir, pat));
       } else {
-        for await (const f of (0, import_promises6.glob)(pat, { cwd: rootDir, nodir: true })) rawCandidates.push(import_node_path6.default.resolve(rootDir, f));
+        for await (const f of (0, import_promises6.glob)(pat, { cwd: rootDir, nodir: true })) rawCandidates.push(import_node_path7.default.resolve(rootDir, f));
       }
     }
   } else if (fileConfig.include) {
     const incs = Array.isArray(fileConfig.include) ? fileConfig.include : [fileConfig.include];
     for (const pat of incs) {
-      for await (const f of (0, import_promises6.glob)(pat, { cwd: rootDir, nodir: true })) rawCandidates.push(import_node_path6.default.resolve(rootDir, f));
+      for await (const f of (0, import_promises6.glob)(pat, { cwd: rootDir, nodir: true })) rawCandidates.push(import_node_path7.default.resolve(rootDir, f));
     }
   }
   if (args.filesFile) {
-    const listPath = import_node_path6.default.resolve(rootDir, args.filesFile);
+    const listPath = import_node_path7.default.resolve(rootDir, args.filesFile);
     const content = await (0, import_promises6.readFile)(listPath, "utf8");
     const lines = content.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
     for (const l of lines) {
-      rawCandidates.push(import_node_path6.default.resolve(rootDir, l));
+      rawCandidates.push(import_node_path7.default.resolve(rootDir, l));
     }
   }
   if (args.stdin || rawCandidates.includes("-")) {
@@ -9334,7 +10943,7 @@ File: ${targetFile}
       }
     }
     if (args.output) {
-      await writeAtomic(import_node_path6.default.resolve(args.output), converted.data);
+      await writeAtomic(import_node_path7.default.resolve(args.output), converted.data);
     } else {
       process.stdout.write(converted.data);
     }
@@ -9369,7 +10978,7 @@ File: ${targetFile}
   const overrideLock = Boolean(args.overrideLock || options.overrideLock);
   if (lockTarget && !overrideLock && isStrict && skippedFiles.some((f) => f.reason === "unsupported_format")) {
     const failedFile = skippedFiles.find((f) => f.reason === "unsupported_format");
-    process.stderr.write(`\u274C ${import_node_path6.default.relative(rootDir, failedFile.path)}: E_UNSUPPORTED_FORMAT: Cannot decode this file into the locked target format (${lockTarget}).
+    process.stderr.write(`\u274C ${import_node_path7.default.relative(rootDir, failedFile.path)}: E_UNSUPPORTED_FORMAT: Cannot decode this file into the locked target format (${lockTarget}).
 Fix: Upload a supported format, or install the format plugin for this file.
 `);
     process.exitCode = 1;
@@ -9387,7 +10996,7 @@ Fix: Upload a supported format, or install the format plugin for this file.
         count: inScopeFiles.length,
         files: inScopeFiles.map((f, idx) => ({
           index: idx + 1,
-          path: import_node_path6.default.relative(rootDir, f.path),
+          path: import_node_path7.default.relative(rootDir, f.path),
           size: f.size,
           format: f.format
         }))
@@ -9398,7 +11007,7 @@ Found ${inScopeFiles.length} media file(s):
 `);
       process.stdout.write("\u2500".repeat(54) + "\n");
       inScopeFiles.forEach((f, idx) => {
-        const rel = import_node_path6.default.relative(rootDir, f.path);
+        const rel = import_node_path7.default.relative(rootDir, f.path);
         const sizeStr = `${(f.size / 1024).toFixed(1)} KB`;
         process.stdout.write(`  [${String(idx + 1).padStart(2)}] ${rel.padEnd(28)} ${sizeStr.padStart(8)}   ${(f.format || "").toUpperCase()}
 `);
@@ -9413,7 +11022,7 @@ Found ${inScopeFiles.length} media file(s):
         count: inScopeFiles.length,
         files: inScopeFiles.map((f, idx) => ({
           index: idx + 1,
-          path: import_node_path6.default.relative(rootDir, f.path),
+          path: import_node_path7.default.relative(rootDir, f.path),
           size: f.size,
           format: f.format,
           selected: false
@@ -9428,7 +11037,7 @@ Found ${inScopeFiles.length} media file(s):
 Found ${inScopeFiles.length} media file(s):
 `);
       inScopeFiles.forEach((f, idx) => {
-        process.stdout.write(`  [${idx + 1}] ${import_node_path6.default.relative(rootDir, f.path)} (${(f.size / 1024).toFixed(1)} KB, ${(f.format || "").toUpperCase()})
+        process.stdout.write(`  [${idx + 1}] ${import_node_path7.default.relative(rootDir, f.path)} (${(f.size / 1024).toFixed(1)} KB, ${(f.format || "").toUpperCase()})
 `);
       });
       const ans = await rl.question('\nEnter indices to convert (comma-separated, e.g. 1,2 or "all"): ');
@@ -9453,7 +11062,7 @@ Found ${inScopeFiles.length} media file(s):
   const scales = args.scales?.length ? args.scales : options.scales?.length ? options.scales : [1];
   const baseWidth = args.baseWidth || options.baseWidth || 512;
   const configuredOutDir = args.outDir || options.outDir;
-  const outDir = configuredOutDir ? import_node_path6.default.resolve(rootDir, configuredOutDir) : args.here ? rootDir : void 0;
+  const outDir = configuredOutDir ? import_node_path7.default.resolve(rootDir, configuredOutDir) : args.here ? rootDir : void 0;
   const patternsForRoot = args.inputs.length ? args.inputs : fileConfig.include ? Array.isArray(fileConfig.include) ? fileConfig.include : [fileConfig.include] : [];
   const commonBase = inputRootForPatterns(patternsForRoot, inScopeFiles.map((f) => f.path), rootDir);
   const plannedOutputsCount = inScopeFiles.length * targetFormats.length * scales.length;
@@ -9527,7 +11136,24 @@ zap run ${(/* @__PURE__ */ new Date()).toISOString()}
     if (args.check) process.exitCode = 1;
     if (!args.watch) return;
   }
-  const policyFile = import_node_path6.default.join(rootDir, "zapwebp.policy.json");
+  const session = await loadSession(rootDir);
+  let totalInputBytes = 0;
+  for (const fileItem of inScopeFiles) {
+    totalInputBytes += fileItem.size || 0;
+  }
+  evaluateLimits({
+    filesCount: inScopeFiles.length,
+    totalBytes: totalInputBytes,
+    sessionCount: session.filesProcessed,
+    limits: options.limits || DEFAULT_LIMITS2
+  });
+  const limitsMetadata = createLimitsMetadata({
+    filesCount: inScopeFiles.length,
+    totalBytes: totalInputBytes,
+    sessionCount: session.filesProcessed,
+    limits: options.limits || DEFAULT_LIMITS2
+  });
+  const policyFile = import_node_path7.default.join(rootDir, "zapwebp.policy.json");
   let teamPolicy = null;
   if (await (0, import_promises6.stat)(policyFile).then(() => true, () => false)) {
     try {
@@ -9543,7 +11169,7 @@ zap run ${(/* @__PURE__ */ new Date()).toISOString()}
       if (!evalRes.allowed && evalRes.violations.length) {
         const enf = isCi ? teamPolicy.enforcement?.onCi || "block" : teamPolicy.enforcement?.onLocal || "warn";
         if (enf === "block") {
-          process.stderr.write(`\u274C Policy Violation: ${import_node_path6.default.relative(rootDir, fileItem.path)}
+          process.stderr.write(`\u274C Policy Violation: ${import_node_path7.default.relative(rootDir, fileItem.path)}
 `);
           for (const v of evalRes.violations) {
             process.stderr.write(`   - ${v}
@@ -9551,7 +11177,7 @@ zap run ${(/* @__PURE__ */ new Date()).toISOString()}
           }
           policyFailed = true;
         } else {
-          process.stderr.write(`\u26A0\uFE0F  Policy Warning: ${import_node_path6.default.relative(rootDir, fileItem.path)}
+          process.stderr.write(`\u26A0\uFE0F  Policy Warning: ${import_node_path7.default.relative(rootDir, fileItem.path)}
 `);
           for (const v of evalRes.violations) {
             process.stderr.write(`   - ${v}
@@ -9571,7 +11197,7 @@ zap run ${(/* @__PURE__ */ new Date()).toISOString()}
       if (!bytes) continue;
       const res = await analyzeSmart(bytes, { format: fileItem.format }, getSharp);
       process.stdout.write(`
-File: ${import_node_path6.default.relative(rootDir, fileItem.path)}
+File: ${import_node_path7.default.relative(rootDir, fileItem.path)}
 ${res.recommendation.explanation}
 `);
     }
@@ -9602,8 +11228,8 @@ ${res.recommendation.explanation}
       try {
         const answer = await rl.question("   Proceed and remember this choice in .zapwebp/config.json? [y/N]: ");
         if (answer.trim().toLowerCase() === "y" || answer.trim().toLowerCase() === "yes") {
-          const zapConfigDir = import_node_path6.default.join(rootDir, ".zapwebp");
-          const zapConfigFile = import_node_path6.default.join(zapConfigDir, "config.json");
+          const zapConfigDir = import_node_path7.default.join(rootDir, ".zapwebp");
+          const zapConfigFile = import_node_path7.default.join(zapConfigDir, "config.json");
           await (0, import_promises6.mkdir)(zapConfigDir, { recursive: true });
           let existingJson = {};
           try {
@@ -9660,12 +11286,21 @@ ${res.recommendation.explanation}
           });
           continue;
         }
+        if (!args.force && !args.noLock && existingOutput && existingOutput.length > 0) {
+          const { verifyLock } = await Promise.resolve().then(() => __toESM(require_src3(), 1));
+          const verification = verifyLock(existingOutput, currentBytes, targetOptions, { force: args.force });
+          if (verification.match) {
+            process.stdout.write(`\u23ED  ${import_node_path7.default.relative(rootDir, dest)} already converted with matching options. Skipped. Use --force to re-convert.
+`);
+            continue;
+          }
+        }
         let converted;
         try {
           converted = await convertImage(currentBytes, targetOptions);
         } catch (err2) {
           if (err2.code === "E_UNSUPPORTED_FORMAT") {
-            process.stderr.write(`\u274C ${import_node_path6.default.relative(rootDir, fileItem.path)}: ${err2.message}
+            process.stderr.write(`\u274C ${import_node_path7.default.relative(rootDir, fileItem.path)}: ${err2.message}
 Fix: ${err2.fix}
 `);
             process.exitCode = 1;
@@ -9673,24 +11308,24 @@ Fix: ${err2.fix}
           }
           throw err2;
         }
-        if (args.verifyHash && args.verifyHash !== "true") {
-          const actualHash = sha256(converted.data);
-          if (actualHash.toLowerCase() !== args.verifyHash.toLowerCase()) {
-            throw new ZapwebpError2({
-              code: "E_VERIFICATION_FAILED",
-              message: `E_VERIFICATION_FAILED: Converted output SHA-256 (${actualHash}) does not match expected hash (${args.verifyHash})`,
-              fix: "Verify the expected hash or check engine version determinism."
-            });
-          }
-        }
         if (converted.passedThrough) {
+          if (args.verifyHash && args.verifyHash !== "true") {
+            const actualHash = sha256(converted.data);
+            if (actualHash.toLowerCase() !== args.verifyHash.toLowerCase()) {
+              throw new ZapwebpError2({
+                code: "E_VERIFICATION_FAILED",
+                message: `E_VERIFICATION_FAILED: Converted output SHA-256 (${actualHash}) does not match expected hash (${args.verifyHash})`,
+                fix: "Verify the expected hash or check engine version determinism."
+              });
+            }
+          }
           await writeAtomic(dest, converted.data);
           operations.push({
             type: "create",
-            path: import_node_path6.default.relative(rootDir, dest).replace(/\\/g, "/"),
+            path: import_node_path7.default.relative(rootDir, dest).replace(/\\/g, "/"),
             sha256: sha256(converted.data),
             bytes: converted.size,
-            inputPath: import_node_path6.default.relative(rootDir, fileItem.path).replace(/\\/g, "/"),
+            inputPath: import_node_path7.default.relative(rootDir, fileItem.path).replace(/\\/g, "/"),
             inputBytes: currentBytes.length,
             format: converted.targetFormat || target,
             fromFormat: fileItem.format,
@@ -9710,13 +11345,32 @@ Fix: ${err2.fix}
           });
           continue;
         }
-        await writeAtomic(dest, converted.data);
+        let outputData = converted.data;
+        if (!args.noLock) {
+          const { writeLock, createLockFingerprint } = await Promise.resolve().then(() => __toESM(require_src3(), 1));
+          const fp = createLockFingerprint({
+            input: currentBytes,
+            options: targetOptions
+          });
+          outputData = writeLock(outputData, converted.targetFormat || target, fp);
+        }
+        if (args.verifyHash && args.verifyHash !== "true") {
+          const actualHash = sha256(outputData);
+          if (actualHash.toLowerCase() !== args.verifyHash.toLowerCase()) {
+            throw new ZapwebpError2({
+              code: "E_VERIFICATION_FAILED",
+              message: `E_VERIFICATION_FAILED: Converted output SHA-256 (${actualHash}) does not match expected hash (${args.verifyHash})`,
+              fix: "Verify the expected hash or check engine version determinism."
+            });
+          }
+        }
+        await writeAtomic(dest, outputData);
         operations.push({
           type: "create",
-          path: import_node_path6.default.relative(rootDir, dest).replace(/\\/g, "/"),
-          sha256: sha256(converted.data),
-          bytes: converted.size,
-          inputPath: import_node_path6.default.relative(rootDir, fileItem.path).replace(/\\/g, "/"),
+          path: import_node_path7.default.relative(rootDir, dest).replace(/\\/g, "/"),
+          sha256: sha256(outputData),
+          bytes: outputData.length,
+          inputPath: import_node_path7.default.relative(rootDir, fileItem.path).replace(/\\/g, "/"),
           inputBytes: currentBytes.length,
           format: target,
           fromFormat: fileItem.format,
@@ -9742,15 +11396,16 @@ Fix: ${err2.fix}
           losslessVerified: converted.losslessVerified,
           sourceQuality: converted.sourceQuality,
           sizeImpact: converted.sizeImpact,
-          compression: converted.compression
+          compression: converted.compression,
+          limits: limitsMetadata
         });
       }
     }
     if (args.deleteOriginal && !args.dryRun && !args.check) {
-      const relSrc = import_node_path6.default.relative(rootDir, fileItem.path).replace(/\\/g, "/");
-      const backupRel = import_node_path6.default.join(".zapwebp", "backups", transactionId, relSrc).replace(/\\/g, "/");
-      const backupFull = import_node_path6.default.resolve(rootDir, backupRel);
-      await (0, import_promises6.mkdir)(import_node_path6.default.dirname(backupFull), { recursive: true });
+      const relSrc = import_node_path7.default.relative(rootDir, fileItem.path).replace(/\\/g, "/");
+      const backupRel = import_node_path7.default.join(".zapwebp", "backups", transactionId, relSrc).replace(/\\/g, "/");
+      const backupFull = import_node_path7.default.resolve(rootDir, backupRel);
+      await (0, import_promises6.mkdir)(import_node_path7.default.dirname(backupFull), { recursive: true });
       await (0, import_promises6.writeFile)(backupFull, currentBytes);
       const backupWritten = await (0, import_promises6.readFile)(backupFull);
       const backupHash = sha256(backupWritten);
@@ -9770,7 +11425,7 @@ Fix: ${err2.fix}
       const cleanupMode = args.cleanup || "immediate";
       if (cleanupMode === "immediate") {
         await (0, import_promises6.rm)(fileItem.path, { force: true });
-        process.stderr.write(`\u{1F5D1}  ${import_node_path6.default.basename(fileItem.path)} \u2192 ${backupRel} (Restore with: zapwebp undo)
+        process.stderr.write(`\u{1F5D1}  ${import_node_path7.default.basename(fileItem.path)} \u2192 ${backupRel} (Restore with: zapwebp undo)
 `);
       } else if (cleanupMode === "session") {
         sessionCleanups.push(fileItem.path);
@@ -9791,7 +11446,7 @@ Fix: ${err2.fix}
     const zipEntries = {};
     for (const r of records) {
       if (r.status === "converted") {
-        const rel = import_node_path6.default.relative(outDir || commonBase, r.output).replace(/\\/g, "/");
+        const rel = import_node_path7.default.relative(outDir || commonBase, r.output).replace(/\\/g, "/");
         zipEntries[rel] = await (0, import_promises6.readFile)(r.output);
       }
     }
@@ -9803,13 +11458,13 @@ Fix: ${err2.fix}
     };
     zipEntries["manifest.json"] = Buffer.from(JSON.stringify(manifestData, null, 2) + "\n", "utf8");
     const archiveBuffer = zipSync(zipEntries);
-    const archivePath = args.output && args.output.endsWith(".zip") ? import_node_path6.default.resolve(args.output) : import_node_path6.default.join(outDir || commonBase, "zap-export.zip");
+    const archivePath = args.output && args.output.endsWith(".zip") ? import_node_path7.default.resolve(args.output) : import_node_path7.default.join(outDir || commonBase, "zap-export.zip");
     await writeAtomic(archivePath, archiveBuffer);
     process.stdout.write(`\u2713 Created archive ${archivePath} (${archiveBuffer.length} bytes; ${records.length} files)
 `);
   }
   if (args.manifest && !args.dryRun) {
-    const manifestPath = import_node_path6.default.join(outDir || commonBase, "manifest.json");
+    const manifestPath = import_node_path7.default.join(outDir || commonBase, "manifest.json");
     const manifestData = {
       generatedBy: "zap 1.1.0",
       generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
@@ -9837,6 +11492,9 @@ Fix: ${err2.fix}
     const retentionDays = options.deleteBackupRetentionDays || fileConfig.deleteBackupRetentionDays || 30;
     await pruneJournal(rootDir, 50, retentionDays).catch(() => {
     });
+  }
+  if (!args.dryRun && !args.check && records.length > 0) {
+    await recordSession(rootDir, inScopeFiles.length);
   }
   if (!args.gitignoreOff) {
     await syncGitignore(rootDir, {
@@ -9867,12 +11525,12 @@ Fix: ${err2.fix}
   }
   if (args.watch) {
     const watchDir = commonBase || rootDir;
-    process.stdout.write(`Watching ${import_node_path6.default.relative(rootDir, watchDir) || "."} for changes...
+    process.stdout.write(`Watching ${import_node_path7.default.relative(rootDir, watchDir) || "."} for changes...
 `);
     const watcher = (0, import_node_fs.watch)(watchDir, { recursive: true }, async (eventType, filename) => {
       if (!filename) return;
-      const fullPath = import_node_path6.default.resolve(watchDir, filename);
-      if (outDir && (fullPath === outDir || fullPath.startsWith(outDir + import_node_path6.default.sep))) return;
+      const fullPath = import_node_path7.default.resolve(watchDir, filename);
+      if (outDir && (fullPath === outDir || fullPath.startsWith(outDir + import_node_path7.default.sep))) return;
       if (fullPath.includes(".zapwebp")) return;
       await new Promise((resolve) => setTimeout(resolve, 60));
       const fileStat = await (0, import_promises6.stat)(fullPath).catch(() => null);
@@ -9906,7 +11564,7 @@ Fix: ${err2.fix}
           try {
             const converted = await convertImage(currentBytes, targetOptions);
             await writeAtomic(dest, converted.data);
-            process.stdout.write(`\u2713 ${import_node_path6.default.relative(rootDir, fullPath)} \u2192 ${import_node_path6.default.relative(rootDir, dest)} (${converted.size} bytes)
+            process.stdout.write(`\u2713 ${import_node_path7.default.relative(rootDir, fullPath)} \u2192 ${import_node_path7.default.relative(rootDir, dest)} (${converted.size} bytes)
 `);
             if (converted.warnings && converted.warnings.length) {
               for (const w of converted.warnings) {
@@ -9933,21 +11591,31 @@ Fix: ${err2.fix}
     });
   }
 }
-var import_promises6, import_node_fs, import_node_path6, import_core2, import_shared3, DEFAULT_OPTIONS2, ZapwebpError2, setLocale, t, convertImage, inspectImage, detectFormat2, outputName, parseScales, scaleSuffix, generateSrcset, auditConversionCommand, explainBlackBackground, computePerformanceReport, formatPerformanceReport, analyzeSmart, DEFAULT_TEAM_POLICY_TEMPLATE, validateTeamPolicy, evaluateFilePolicy, checkExceptionsStatus, formatPolicyStatus, getSharp, INPUT_FORMATS2, OUTPUT_FORMATS, HELP;
+var import_promises6, import_node_fs, import_node_path7, import_core2, import_shared4, DEFAULT_OPTIONS2, DEFAULT_LIMITS2, evaluateLimits, createLimitsMetadata, formatBytes, ZapwebpError2, setLocale, t, convertImage, inspectImage, detectFormat2, outputName, parseScales, scaleSuffix, generateSrcset, auditConversionCommand, explainBlackBackground, computePerformanceReport, formatPerformanceReport, analyzeSmart, DEFAULT_TEAM_POLICY_TEMPLATE, validateTeamPolicy, evaluateFilePolicy, checkExceptionsStatus, formatPolicyStatus, getSharp, INPUT_FORMATS2, OUTPUT_FORMATS, HELP;
 var init_src = __esm({
   "packages/cli/src/index.js"() {
     import_promises6 = require("node:fs/promises");
     import_node_fs = require("node:fs");
-    import_node_path6 = __toESM(require("node:path"), 1);
+    import_node_path7 = __toESM(require("node:path"), 1);
     init_esm();
     import_core2 = __toESM(require_src2(), 1);
-    import_shared3 = __toESM(require_src(), 1);
+    import_shared4 = __toESM(require_src(), 1);
+    init_session();
     init_fs();
     init_gate_chain();
     init_journal();
     init_gitignore();
     init_config();
-    ({ DEFAULT_OPTIONS: DEFAULT_OPTIONS2, ZapwebpError: ZapwebpError2, setLocale, t } = import_shared3.default);
+    ({
+      DEFAULT_OPTIONS: DEFAULT_OPTIONS2,
+      DEFAULT_LIMITS: DEFAULT_LIMITS2,
+      evaluateLimits,
+      createLimitsMetadata,
+      formatBytes,
+      ZapwebpError: ZapwebpError2,
+      setLocale,
+      t
+    } = import_shared4.default);
     ({
       convertImage,
       inspectImage,
@@ -9970,95 +11638,7 @@ var init_src = __esm({
       INPUT_FORMATS: INPUT_FORMATS2,
       OUTPUT_FORMATS
     } = import_core2.default);
-    HELP = `zapwebp \u2014 SVG \u2192 WebP, safe, reversible, and scoped.
-
-USAGE
-  zap [paths...] [options]
-  zap <command> [options]
-
-COMMANDS
-  init              Set up config, ignore rules, and .gitignore (--team for policy)
-  watch             Convert on change (undoable)
-  report [path]     Show aggregate performance savings report
-  policy <cmd>      Manage team governance policy (validate, status)
-  audit             Dry-run + safety audit report or command linter
-  check             CI mode: exit 1 if any conversion is needed
-  explain <file>    Explain why a file will or won't convert
-  ignored [dir]     Explain why files are skipped by ignore rules
-  history           List past conversion transactions
-  undo [id|step]    Revert the last run (or a specific transaction)
-  redo [id]         Reapply the last undone transaction
-  show <id>         Inspect a transaction's operations
-  gc                Prune old journal logs and backups
-  gitignore <subcmd> Manage .gitignore block (show, add, remove)
-  config show       Display resolved configuration and origins
-  doctor            Verify system environment and dependencies
-  inspect <image>   Analyze image container and metadata chunks
-  explain-black-bg  Explain ImageMagick black background bugs
-
-OPTIONS
-  -o, --output <file>     Output file (single input) or .zip archive
-      --out-dir <dir>     Destination folder for converted outputs
-      --to <formats>      Target format(s), comma-separated (default: webp)
-      --from <format>     Restrict input format filter
-      --smart             Deterministic pixel analysis to recommend/apply best format
-      --explain           Explain smart optimization decision
-      --since <period>    Filter report by timeframe (e.g. "30 days ago", "7d")
-      --team              Initialize team governance policy (zap init --team)
-      --scale <scales>    Multiplier scales, e.g. 1,2,3 (default: 1)
-      --base-width <px>   Base pixel width for scale 1x (default: 512)
-      --width <px>        Explicit output width (max 4096)
-      --height <px>       Explicit output height (max 4096)
-      --fit <mode>        contain, cover, fill, inside, outside
-      --quality <0-100>   Compression quality (default: 85)
-      --lossless          Encode losslessly where supported
-      --effort <0-9>      Encoding effort
-      --background <col>  Flatten color for JPEG output
-      --clean             Strip AI provenance and metadata (default: true)
-      --no-clean          Preserve container metadata
-      --verify <hash>     Verify output SHA-256 matches expected hash before writing
-      --verify-clean      Enforce 0 metadata chunks and Clean Certificate
-      --assert-alpha      Strictly fail if transparent input loses alpha
-      --lock-target <fmt> Enforce many-to-one conversion to specified format
-      --strict            Strictly fail on unconvertible inputs (default when locked)
-      --no-strict         Pass through unconvertible files unchanged
-      --same-format <mod> Action when input matches target: passthrough (default), reencode, reject
-      --size-mode <mode>  Size contract enforcement: compress (default), strict, flexible
-      --flexible          Alias for --size-mode flexible (warn only, never reject or degrade)
-      --min-input <bytes> Reject inputs smaller than minimum byte limit (e.g. 500B, 10KB)
-      --max-input <bytes> Reject inputs larger than maximum byte limit (e.g. 15MB)
-      --min-output <byte> Validate output meets minimum byte size
-      --max-output <byte> Compress or validate output under maximum byte size
-      --target <size>     Target maximum output size with adaptive compression (e.g. 500kb, 1mb)
-      --min-quality <q>   Minimum quality floor before downscaling (default: 10)
-      --no-downscale      Disallow downscaling to meet target size
-      --override-lock     Explicit opt-in to bypass configured target lock
-      --zip               Bundle outputs into a single ZIP archive
-      --srcset            Print responsive <img srcset> HTML tags
-      --changed           Only convert files modified vs HEAD (git)
-      --staged            Only convert files in git staging area
-      --include-ignored   Bypass .zapwebpignore and config ignores
-      --include-all       Bypass all ignore layers including built-ins
-      --follow-symlinks   Follow symbolic links (disabled by default)
-      --allow-outside     Allow paths outside current workspace
-      --allow-unsafe      Permit SVGs with minor safety warnings
-      --force             Force conversion of up-to-date files
-      --force-undo        Force undo even if outputs were modified
-      --commit-outputs    Do not add outDir to .gitignore
-      --gitignore=off     Disable automatic .gitignore management
-      --stdin             Read image from standard input
-      --manifest          Write manifest.json
-      --dry-run           Plan conversion without writing files or journal
-      --json              Emit machine-readable JSON output
-      --config <file>     Explicit path to configuration file
-  -h, --help              Show this help
-
-SAFETY & PRIVACY
-  \u2022 Zero telemetry. Zero network calls. Files never leave your machine.
-  \u2022 Reversible: every run creates an undoable journal in .zapwebp/journal/.
-  \u2022 TOCTOU safe: files are re-verified immediately before writing.
-  \u2022 Atomic writes: tmp -> rename ensures no half-written files.
-`;
+    HELP = getHelpText();
     main().catch((error) => {
       if (error instanceof ZapwebpError2) {
         process.stderr.write(`\u26A1 zap! ${error.message}
