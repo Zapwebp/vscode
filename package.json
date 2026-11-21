@@ -1,4 +1,4 @@
-{
+﻿{
   "name": "zapwebp-vscode",
   "displayName": "Zapwebp",
   "description": "Convert images correctly in VS Code. Transparency preserved, metadata stripped, no uploads.",
@@ -213,7 +213,7 @@
           "default": 85,
           "minimum": 0,
           "maximum": 100,
-          "description": "Lossy quality (0â€“100)."
+          "description": "Lossy quality (0Ã¢â‚¬â€œ100)."
         },
         "zapwebp.clean": {
           "type": "boolean",
@@ -271,7 +271,7 @@
     "sharp": "^0.35.5"
   },
   "devDependencies": {
-    "@zapwebp/core": "workspace:*",
+    "@zapwebp/core": "^1.1.2",
     "esbuild": "^0.25.0"
   },
   "homepage": "https://zapwebp.vercel.app",
@@ -284,3 +284,4 @@
   },
   "author": "Eldrex Delos Reyes Bula <eldrexdelosreyesbula@gmail.com>"
 }
+
